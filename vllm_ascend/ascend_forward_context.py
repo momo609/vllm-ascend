@@ -25,33 +25,35 @@ class FusedMoEState(Enum):
 # TODO(zzzzwwjj): add soc_version to choose branch
 def _get_fused_moe_state(ep_size: int, with_prefill: bool,
                          is_deepseek_v3_r1: bool):
-    # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
-    # only supports deepseek v3/r1
-    if (envs_ascend.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1
-            and is_deepseek_v3_r1):
-        return FusedMoEState.AllGatherEP
-    elif ep_size == 1:
-        if with_prefill:
-            return FusedMoEState.NaiveMulticast
-        else:
-            return FusedMoEState.AllGather
-    # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
-    elif ep_size < 16 or with_prefill:
-        return FusedMoEState.All2All
-    else:
-        return FusedMoEState.MC2
+    # # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
+    # # only supports deepseek v3/r1
+    # if (envs_ascend.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1
+    #         and is_deepseek_v3_r1):
+    #     return FusedMoEState.AllGatherEP
+    # elif ep_size == 1:
+    #     if with_prefill:
+    #         return FusedMoEState.NaiveMulticast
+    #     else:
+    #         return FusedMoEState.AllGather
+    # # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
+    # elif ep_size < 16 or with_prefill:
+    #     return FusedMoEState.All2All
+    # else:
+    #     return FusedMoEState.MC2
+    return FusedMoEState.AllGather
 
 
 def get_dispatcher_name(ep_size: int, with_prefill: bool) -> str:
-    if ep_size == 1:
-        return "TokenDispatcherWithAllGather"
+    # if ep_size == 1:
+    #     return "TokenDispatcherWithAllGather"
 
-    if ep_size < 16:
-        return "TokenDispatcherWithAll2AllV"
+    # if ep_size < 16:
+    #     return "TokenDispatcherWithAll2AllV"
 
-    if with_prefill:
-        return "TokenDispatcherWithAll2AllV"
-    return "TokenDispatcherWithMC2"
+    # if with_prefill:
+    #     return "TokenDispatcherWithAll2AllV"
+    # return "TokenDispatcherWithMC2"
+    return "TokenDispatcherWithAllGather"
 
 
 @contextmanager
