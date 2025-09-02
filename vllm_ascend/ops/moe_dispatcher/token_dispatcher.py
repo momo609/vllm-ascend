@@ -414,17 +414,21 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                 expert_tokens = expert_tokens.to(torch.int64)
                 group_list_type = 1  # `count` mode
         else:
-            active_num = self.max_num_tokens if self.max_num_tokens is not None else num_tokens
-            sorted_hidden_states, self.expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
-                hidden_states,
-                row_idx=row_idx,
-                expert_idx=topk_ids,
-                active_num=active_num)
+            global_num_experts = len(expert_map)
 
-            expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-                expanded_expert_idx, self.num_experts_local)
+            sorted_hidden_states, self.expanded_row_idx, expert_tokens, _ = (
+                torch_npu.npu_moe_init_routing_v2(
+                    hidden_states,
+                    topk_ids,
+                    active_num=num_tokens * self.top_k,
+                    expert_num=global_num_experts,
+                    expert_tokens_num_type=1,  # Only support `count` mode now
+                    expert_tokens_num_flag=True,  # Output `expert_tokens`
+                    active_expert_range=[0, global_num_experts],
+                    quant_mode=-1,
+                ))
             expert_tokens = expert_tokens.to(torch.int64)
-            group_list_type = 0
+            group_list_type = 1  # `count` mode
         return {
             "group_list_type": group_list_type,
             "hidden_states": sorted_hidden_states,
@@ -467,18 +471,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                                                     sorted_indices=self.expanded_row_idx,
                                                     probs=self.topk_weights)
         else:
-            scales = torch.ones_like(
-                    self.topk_weights
-                ) if self.apply_router_weight_on_input else self.topk_weights
-            final_hidden_states = torch_npu.npu_moe_finalize_routing(
-                hidden_states,
-                skip1=None,
-                skip2=None,
-                bias=None,
-                scales=scales,
-                expanded_src_to_dst_row=self.expanded_row_idx,
-                export_for_source_row=self.topk_ids,
-            )
+            final_hidden_states = torch_npu.npu_moe_token_unpermute(
+                                                    permuted_tokens=hidden_states,
+                                                    sorted_indices=self.expanded_row_idx,
+                                                    probs=self.topk_weights)
         if len(self.original_shape) == 3:
             final_hidden_states = final_hidden_states.view(
                 self.original_shape)
