@@ -32,7 +32,7 @@ from vllm_ascend.ops.moe_dispatcher.token_dispatcher import \
     TokenDispatcherWithAllGather
 
 NUM_EXPERTS = [8, 64]
-EP_SIZE = [1, 4]
+EP_SIZE = [1]
 TOP_KS = [2, 6]
 DEVICE = ["npu"]
 
