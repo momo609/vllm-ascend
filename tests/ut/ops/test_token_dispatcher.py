@@ -179,8 +179,7 @@ class TestTokenDispatcherWithAllGather(TestBase):
             torch.randn(6, 128),  # sorted_hidden_states
             torch.tensor([0, 1, 2, 3, 4, 5]),  # expanded_row_idx
             torch.tensor([0, 1, 0, 1, 0, 1]),  # expanded_expert_idx
-            torch.tensor([0, 1, 0, 1, 0, 1])
-        )
+            torch.tensor([0, 1, 0, 1, 0, 1]))
         self.row_idx = torch.arange(10, dtype=torch.int32)
         self.patcher_npu_moe_token_unpermute = patch(
             'torch_npu.npu_moe_token_unpermute')
