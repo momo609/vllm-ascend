@@ -11,6 +11,7 @@ from vllm.forward_context import (BatchDescriptor, get_forward_context,
                                   set_forward_context)
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.utils import AscendSocVersion
 
 
 class FusedMoEState(Enum):
@@ -42,16 +43,21 @@ def _get_fused_moe_state(ep_size: int, with_prefill: bool,
         return FusedMoEState.MC2
 
 
-def get_dispatcher_name(ep_size: int, with_prefill: bool) -> str:
+def get_dispatcher_name(ep_size: int, with_prefill: bool,
+                        soc_version: int, mc2_tokens_capacity: int,
+                        num_tokens: int) -> str:
     if ep_size == 1:
         return "TokenDispatcherWithAllGather"
-
-    if ep_size < 16:
-        return "TokenDispatcherWithAll2AllV"
-
-    if with_prefill:
-        return "TokenDispatcherWithAll2AllV"
-    return "TokenDispatcherWithMC2"
+    if soc_version in {AscendSocVersion.A2}:
+        if num_tokens <= mc2_tokens_capacity and ep_size >=16:
+            return "TokenDispatcherWithMC2"
+        else:
+            return "TokenDispatcherWithAllGather"
+    elif soc_version in {AscendSocVersion.A3}:
+        if num_tokens <= mc2_tokens_capacity:
+            return "TokenDispatcherWithMC2"
+        else:
+            return "TokenDispatcherWithAll2AllV"
 
 
 @contextmanager
@@ -67,7 +73,8 @@ def set_ascend_forward_context(
         moe_comm_method: str = "",
         num_actual_tokens: Optional[int] = None,
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        batch_descriptor: Optional[BatchDescriptor] = None):
+        batch_descriptor: Optional[BatchDescriptor] = None,
+        soc_version: Optional[int] = None,):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
@@ -97,7 +104,10 @@ def set_ascend_forward_context(
 
         from vllm_ascend.ops.moe_dispatcher.token_dispatcher import \
             get_token_dispatcher
-        dispatcher_name = get_dispatcher_name(ep_size, with_prefill)
+        mc2_tokens_capacity = 512 * vllm_config.parallel_config.tensor_parallel_size
+        dispatcher_name = get_dispatcher_name(ep_size, with_prefill,
+                                              soc_version, mc2_tokens_capacity,
+                                              num_tokens)
         dispatcher = get_token_dispatcher(dispatcher_name)
         forward_context.token_dispatcher = dispatcher
 

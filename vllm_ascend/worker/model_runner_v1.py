@@ -1680,7 +1680,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     num_actual_tokens=scheduler_output.
-                    total_num_scheduled_tokens):
+                    total_num_scheduled_tokens,
+                    soc_version = get_ascend_soc_version()):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(
@@ -2129,7 +2130,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     moe_comm_method=moe_comm_method,
                     num_actual_tokens=0,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    batch_descriptor=batch_descriptor):
+                    batch_descriptor=batch_descriptor,
+                    soc_version = get_ascend_soc_version()):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
                     attn_metadata, num_tokens, intermediate_tensors,
