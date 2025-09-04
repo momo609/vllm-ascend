@@ -362,19 +362,26 @@ def forward_oot(
 
 def process_weights_after_loading(self, layer):
     super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
-    w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(
-        1, 2).contiguous()
-    layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+    if self.transpose:
+        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(
+            1, 2).contiguous()
+        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
 
-    w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(
-        1, 2).contiguous()
-    layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(
+            1, 2).contiguous()
+        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
-    if not is_310p():
-        layer.w13_weight.data = torch_npu.npu_format_cast(
-            layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        layer.w2_weight.data = torch_npu.npu_format_cast(
-            layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        if not is_310p():
+            layer.w13_weight.data = torch_npu.npu_format_cast(
+                layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w2_weight.data = torch_npu.npu_format_cast(
+                layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+    else:
+        w13_data = self._maybe_pad_weight(layer.w13_weight.data)
+        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+
+        w2_data = self._maybe_pad_weight(layer.w2_weight.data)
+        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
 
 class AscendFusedMoE(FusedMoE):
@@ -459,7 +466,7 @@ class AscendFusedMoE(FusedMoE):
                 num_redundant_experts,
                 has_bias,
             )
-
+        self.transpose = True
         setup_token_dispatchers(self.moe_config.ep_size,
                                 top_k=self.top_k,
                                 num_experts=self.global_num_experts,
@@ -520,6 +527,61 @@ class AscendFusedMoE(FusedMoE):
             reduce_results=self.reduce_results)
 
         return final_hidden_states
+
+    def _load_w13(self, 
+                  expert_data: torch.Tensor,
+                  shard_dim: int,
+                  shard_id: str,
+                  loaded_weight: torch.Tensor,
+                  tp_rank: int,
+                  load_full: bool = False):
+        if expert_data.shape[1] != loaded_weight.shape[1]:
+            loaded_weight = loaded_weight.transpose(0, 1).contiguous()
+            if not is_310p():
+                loaded_weight = torch_npu.npu_format_cast(
+                    loaded_weight, ACL_FORMAT_FRACTAL_NZ)
+            self.transpose = False
+        # Index the loaded weight for tp sharding.
+        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+        shard_size = expert_data.shape[shard_dim] // 2
+        if not load_full:
+            loaded_weight = loaded_weight.narrow(shard_dim,
+                                                 shard_size * tp_rank,
+                                                 shard_size)
+        # Narrow parameter and load.
+        # w1, gate_proj: Load into first logical weight of w13.
+        if shard_id == "w1":
+            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+        # w3, up_proj: Load into second logical weight of w13.
+        else:
+            assert shard_id == "w3"
+            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+        expert_data.copy_(loaded_weight)
+
+    def _load_w2(self,
+                 expert_data: torch.Tensor,
+                 shard_dim: int,
+                 loaded_weight: torch.Tensor,
+                 tp_rank: int,
+                 load_full: bool = False):
+
+        # Index the loaded weight for tp sharding.
+        # down_proj: "RowParallel" so tp sharding on input_dim
+        # Narrow parameter and load.
+        if expert_data.shape[1] != loaded_weight.shape[1]:
+            loaded_weight = loaded_weight.transpose(0, 1).contiguous()
+            if not is_310p():
+                loaded_weight = torch_npu.npu_format_cast(
+                    loaded_weight, ACL_FORMAT_FRACTAL_NZ)
+            self.transpose = False
+        shard_size = expert_data.shape[shard_dim]
+        if not load_full:
+            loaded_weight = loaded_weight.narrow(shard_dim,
+                                                 shard_size * tp_rank,
+                                                 shard_size)
+        # w2, down_proj: Load into only logical weight of w2.
+        expert_data.copy_(loaded_weight)
+
 
 
 UnquantizedFusedMoEMethod.__init__ = unquantized_fused_moe_init_func
