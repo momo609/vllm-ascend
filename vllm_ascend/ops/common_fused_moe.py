@@ -235,6 +235,7 @@ def unquantized_fused_moe_init_func(self, *args, **kwargs):
         self.use_aclgraph = (vllm_config.compilation_config.level
                              == CompilationLevel.PIECEWISE
                              and not vllm_config.model_config.enforce_eager)
+    self.transpose = True
 
 
 def forward_oot_v01011(
@@ -376,6 +377,7 @@ def process_weights_after_loading(self, layer):
                 layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(
                 layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        self.transpose = False
     else:
         w13_data = self._maybe_pad_weight(layer.w13_weight.data)
         layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
@@ -466,7 +468,7 @@ class AscendFusedMoE(FusedMoE):
                 num_redundant_experts,
                 has_bias,
             )
-        self.transpose = True
+        self.transpose = False
         setup_token_dispatchers(self.moe_config.ep_size,
                                 top_k=self.top_k,
                                 num_experts=self.global_num_experts,
@@ -535,12 +537,13 @@ class AscendFusedMoE(FusedMoE):
                   loaded_weight: torch.Tensor,
                   tp_rank: int,
                   load_full: bool = False):
-        if expert_data.shape[1] != loaded_weight.shape[1]:
+        if self.transpose:
             loaded_weight = loaded_weight.transpose(0, 1).contiguous()
             if not is_310p():
                 loaded_weight = torch_npu.npu_format_cast(
                     loaded_weight, ACL_FORMAT_FRACTAL_NZ)
-            self.transpose = False
+        else:
+            self.transpose = True
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
@@ -568,12 +571,13 @@ class AscendFusedMoE(FusedMoE):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
-        if expert_data.shape[1] != loaded_weight.shape[1]:
+        if self.transpose:
             loaded_weight = loaded_weight.transpose(0, 1).contiguous()
             if not is_310p():
                 loaded_weight = torch_npu.npu_format_cast(
                     loaded_weight, ACL_FORMAT_FRACTAL_NZ)
-            self.transpose = False
+        else:
+            self.transpose = True
         shard_size = expert_data.shape[shard_dim]
         if not load_full:
             loaded_weight = loaded_weight.narrow(shard_dim,
