@@ -24,7 +24,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypeAlias
 
 import numpy as np
 import torch
@@ -526,8 +526,8 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded: int,
         num_reqs_padded: int,
         num_reqs: int,
-        cudagraph_runtime_mode: CUDAGraphMode,
-        batch_desc_num_reqs: int,
+        cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        batch_desc_num_reqs: Optional[int] = None,
     ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
