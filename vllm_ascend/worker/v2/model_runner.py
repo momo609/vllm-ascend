@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.logger import logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -51,9 +52,32 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode.dspark.adaptive_verification import (
+    AscendAdaptiveVerificationManager,
+)
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+
+
+class _ProposalSkippingSpeculator:
+    """Delegate verifier state while making the next proposal a no-op."""
+
+    supports_mm_inputs = False
+
+    def __init__(self, speculator):
+        self._speculator = speculator
+
+    def __getattr__(self, name):
+        return getattr(self._speculator, name)
+
+    def propose(self, input_batch, *args, **kwargs):
+        return self._speculator.draft_tokens[: input_batch.num_reqs]
+
+
+class _NoopDraftTokensHandler:
+    def set_draft_tokens(self, input_batch, draft_tokens) -> None:
+        return None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -106,6 +130,36 @@ class NPUModelRunner(GPUModelRunner):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+
+        self.adaptive_verification: AscendAdaptiveVerificationManager | None = None
+        self._num_spec_tokens_to_schedule = self.num_speculative_steps
+        adaptive_config = self.ascend_config.dspark_hardware_aware_verification
+        if adaptive_config.enabled and adaptive_config.has_cost_curves:
+            unsupported: list[str] = []
+            if self.speculative_config is None or not self.speculative_config.use_dspark():
+                unsupported.append("a non-DSpark speculative method")
+            if self.parallel_config.pipeline_parallel_size > 1:
+                unsupported.append("pipeline parallelism")
+            if self.parallel_config.data_parallel_size > 1:
+                unsupported.append("data parallelism")
+            if self.parallel_config.prefill_context_parallel_size > 1:
+                unsupported.append("prefill context parallelism")
+            if self.parallel_config.decode_context_parallel_size > 1:
+                unsupported.append("decode context parallelism")
+            if self.lora_config is not None:
+                unsupported.append("LoRA")
+            if unsupported:
+                logger.warning_once(
+                    "DSpark hardware-aware verification is disabled for %s; "
+                    "falling back to fixed-length verification.",
+                    ", ".join(unsupported),
+                )
+            else:
+                self.adaptive_verification = AscendAdaptiveVerificationManager(
+                    self.req_states,
+                    self.model_state.num_new_sampled_tokens_per_step,
+                    adaptive_config,
+                )
 
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
@@ -254,6 +308,7 @@ class NPUModelRunner(GPUModelRunner):
                 query_start_loc_np,
                 batch_desc.cg_mode,
                 batch_desc.num_reqs,
+                batch_desc.uniform_token_count,
             )
 
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
@@ -369,6 +424,123 @@ class NPUModelRunner(GPUModelRunner):
 
         return input_batch
 
+    def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().add_requests(scheduler_output)
+        if self.adaptive_verification is None:
+            return
+        for new_request in scheduler_output.scheduled_new_reqs:
+            req_idx = self.req_states.req_id_to_index[new_request.req_id]
+            self.adaptive_verification.reset_slot(req_idx)
+
+    def _can_adapt_verification(self, scheduler_output: SchedulerOutput) -> bool:
+        if (
+            self.adaptive_verification is None
+            or self.speculator is None
+            or not getattr(
+                self.speculator, "use_hardware_aware_verification", False
+            )
+            or scheduler_output.has_structured_output_requests
+        ):
+            return False
+        try:
+            slots = np.fromiter(
+                (
+                    self.req_states.req_id_to_index[req_id]
+                    for req_id in scheduler_output.num_scheduled_tokens
+                ),
+                dtype=np.int32,
+                count=len(scheduler_output.num_scheduled_tokens),
+            )
+        except KeyError:
+            return False
+        if self.sampler is None:
+            return False
+        sampling_states = self.sampler.sampling_states
+        return bool(
+            np.all(sampling_states.temperature.np[slots] == 0.0)
+            and np.all(sampling_states.num_logprobs[slots] == -1)
+        )
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors=None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
+    ):
+        if not dummy_run:
+            self._num_spec_tokens_to_schedule = (
+                scheduler_output.num_spec_tokens_to_schedule
+            )
+        effective_output = scheduler_output
+        if not dummy_run and self._can_adapt_verification(scheduler_output):
+            assert self.adaptive_verification is not None
+            effective_output = self.adaptive_verification.plan_scheduler_output(
+                scheduler_output
+            )
+        return super().execute_model(
+            effective_output,
+            intermediate_tensors=intermediate_tensors,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
+        )
+
+    @torch.inference_mode()
+    def sample_tokens(self, grammar_output):
+        proposal_executed = self._num_spec_tokens_to_schedule > 0
+        if not proposal_executed and self.speculator is not None:
+            input_batch = (
+                self.execute_model_state.input_batch
+                if self.execute_model_state is not None
+                else None
+            )
+            original_speculator = self.speculator
+            original_handler = self.draft_tokens_handler
+            self.speculator = _ProposalSkippingSpeculator(original_speculator)
+            self.draft_tokens_handler = _NoopDraftTokensHandler()
+            try:
+                output = super().sample_tokens(grammar_output)
+            finally:
+                self.speculator = original_speculator
+                self.draft_tokens_handler = original_handler
+            original_handler.req_ids = input_batch.req_ids if input_batch else []
+            original_handler.num_draft_tokens = 0
+            original_handler.draft_tokens_np = None
+        else:
+            output = super().sample_tokens(grammar_output)
+            if self.num_speculative_steps > 0:
+                self.draft_tokens_handler.num_draft_tokens = min(
+                    self.draft_tokens_handler.num_draft_tokens,
+                    self._num_spec_tokens_to_schedule,
+                )
+        if (
+            output is not None
+            and proposal_executed
+            and self.adaptive_verification is not None
+            and self.speculator is not None
+            and getattr(
+                self.speculator, "use_hardware_aware_verification", False
+            )
+            and self.speculator.input_batch is not None
+        ):
+            self.adaptive_verification.record_confidences(
+                self.speculator.input_batch,
+                self.speculator.draft_token_confidence_probs,
+            )
+        return output
+
+    def take_draft_token_ids(self):
+        draft_token_ids = super().take_draft_token_ids()
+        if draft_token_ids is not None:
+            num_tokens = self._num_spec_tokens_to_schedule
+            draft_token_ids.draft_token_ids = [
+                row[:num_tokens] for row in draft_token_ids.draft_token_ids
+            ]
+        return draft_token_ids
+
     def postprocess_sampled(
         self,
         idx_mapping,
@@ -438,6 +610,7 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc_np: np.ndarray,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
+        uniform_token_count: int | None = None,
     ) -> tuple[np.ndarray, int]:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
@@ -450,13 +623,14 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
-        if num_tokens_padded == num_reqs_padded * self.decode_query_len:
+        effective_query_len = uniform_token_count or self.decode_query_len
+        if num_tokens_padded == num_reqs_padded * effective_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
             last_loc = query_start_loc_np[num_reqs]
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
-                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
+                np.arange(1, num_reqs_padded + 1 - num_reqs) * effective_query_len + last_loc
             )
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded

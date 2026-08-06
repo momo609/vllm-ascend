@@ -89,6 +89,27 @@ class DSparkMarkovHead(nn.Module):
         return self.logits_processor(self.markov_w2, markov_embed)
 
 
+class DSparkConfidenceHead(nn.Module):
+    """Estimate the conditional acceptance probability of a DSpark draft."""
+
+    def __init__(self, input_dim: int, prefix: str) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(
+            input_dim,
+            1,
+            bias=False,
+            return_bias=False,
+            params_dtype=torch.float32,
+            prefix=maybe_prefix(prefix, "proj"),
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        inputs = torch.cat((hidden_states, markov_embed), dim=-1).float()
+        return self.proj(inputs).squeeze(-1)
+
+
 class DeepseekV4DSparkModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -138,6 +159,12 @@ class DeepseekV4DSparkModel(nn.Module):
             config,
             maybe_prefix(prefix, f"layers.{last_layer_idx}.markov_head"),
         )
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(config, "enable_confidence_head", True):
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                maybe_prefix(prefix, f"layers.{last_layer_idx}.confidence_head"),
+            )
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
             torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
@@ -154,6 +181,7 @@ class DeepseekV4DSparkModel(nn.Module):
         last_layer = self.layers[str(last_layer_idx)]
         last_layer.norm = self.norm
         last_layer.markov_head = self.markov_head
+        last_layer.confidence_head = self.confidence_head
         last_layer.hc_head_fn = self.hc_head_fn
         last_layer.hc_head_base = self.hc_head_base
         last_layer.hc_head_scale = self.hc_head_scale
@@ -332,6 +360,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_bias(markov_embed)
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.model.confidence_head is not None
+        return self.model.confidence_head(head_hidden, markov_embed)
+
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return self.model.get_draft_kv_cache_layer_names()
 
@@ -372,6 +406,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        loaded_confidence_head = False
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -389,6 +424,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
                 if mapped_name is None:
                     continue
                 name = mapped_name
+                if "confidence_head." in name:
+                    loaded_confidence_head = True
 
             # Expert scale parameters use a dtype-specific suffix; other
             # quantized parameters use Ascend's ``weight_scale`` convention.
@@ -442,6 +479,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        if self.model.confidence_head is not None and not loaded_confidence_head:
+            self.model.confidence_head = None
+            last_layer_idx = self.model.mtp_start_layer_idx + self.model.num_dspark_layers - 1
+            self.model.layers[str(last_layer_idx)].confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -452,7 +493,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
         stage = int(m.group(1))
         rest = m.group(2)
 
-        if rest.startswith("confidence_head."):
+        if rest.startswith("confidence_head.") and self.model.confidence_head is None:
             return None
 
         if stage == 0 and rest == "embed.weight":
@@ -466,7 +507,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
         last_layer_idx = first_layer_idx + self.model.num_dspark_layers - 1
         if rest.startswith(("main_proj.", "main_norm.")):
             layer_idx = first_layer_idx
-        elif rest.startswith(("norm.", "markov_head.")):
+        elif rest.startswith(("norm.", "markov_head.", "confidence_head.")):
             layer_idx = last_layer_idx
         else:
             layer_idx = first_layer_idx + stage

@@ -93,6 +93,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. Can also be configured via the `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable during the migration period. |
 | `enable_dsa_cp`                     | bool | `False` | Whether to enable dsa_cp for DeepSeek V3.2, DeepSeek V4, and other models with the same architecture. This feature depends on FlashComm1. Please ensure that FlashComm1 is enabled before enabling this feature.|
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
+| `dspark_hardware_aware_verification`| dict | `{}`    | DSpark-only hardware-aware verification using stale confidence and configured Ascend timing curves. |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `enable_reduce_sample`              | bool | `False` | Whether to enable reduce sample optimization to reduce communication and computation overheads in the tensor parallelism scenario. When enabled, logits are kept partitioned across TP ranks and only the small set of top-k candidate values/indices is communicated, instead of performing a full-vocabulary all-to-all/all-gather. |
 
@@ -169,6 +170,40 @@ The legacy top-level `enable_balance_scheduling`, `recompute_scheduler_enable`, 
 | `enable_entropy_verify` | bool  | `False` | Whether to enable entropy verify mode. Entropy verify adjusts the acceptance threshold based on the entropy of the target distribution — higher entropy (uncertain) tokens get a lower threshold (easier to accept), while lower entropy (confident) tokens get a stricter threshold. |
 | `posterior_threshold`   | float | `0.95`  | Upper bound for the entropy-adjusted acceptance threshold. Must be in (0, 1]. The effective threshold is `min(exp(-entropy * posterior_alpha), posterior_threshold)`. |
 | `posterior_alpha`       | float | `0.4`   | Scaling factor for entropy in the threshold computation. Must be >= 0. Higher values make the threshold more sensitive to entropy — high-entropy tokens become much easier to accept, improving performance but reducing precision. |
+
+**dspark_hardware_aware_verification**
+
+This option applies only to MRV2 DSpark. It selects a per-batch Target verification
+budget from a stale, asynchronously copied confidence snapshot. Unsupported cases or
+missing model capabilities fall back to fixed-length DSpark verification.
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled` | bool | `False` | Enable DSpark hardware-aware verification. |
+| `allocation_mode` | str | `"stale_cpu"` | Allocation implementation. Only `stale_cpu` is currently supported. |
+| `profile_mode` | str | `"configured"` | Cost source. Only explicitly configured curves are currently supported. |
+| `min_predicted_gain` | float | `0.02` | Minimum predicted throughput improvement over fixed verification; otherwise use the fixed budget. |
+| `require_calibration` | bool | `True` | Require positive `dspark_confidence_temperatures` in the model configuration. |
+| `cudagraph_limit` | int | `0` | Largest physical-token size treated as an ACL Graph bucket. Use `0` for eager interpolation. |
+| `draft_cost_curve` | list | `[]` | Measured `[decode_request_count, milliseconds]` points for the DSpark proposer. |
+| `verify_cost_curve` | list | `[]` | Measured `[physical_target_tokens, milliseconds]` points for Target verification. |
+
+Example (the timing values are illustrative and must be measured for the deployment):
+
+```json
+{
+  "dspark_hardware_aware_verification": {
+    "enabled": true,
+    "allocation_mode": "stale_cpu",
+    "profile_mode": "configured",
+    "min_predicted_gain": 0.02,
+    "require_calibration": true,
+    "cudagraph_limit": 128,
+    "draft_cost_curve": [[1, 0.31], [32, 0.42], [64, 0.57]],
+    "verify_cost_curve": [[32, 0.85], [64, 0.91], [128, 1.08], [256, 1.62]]
+  }
+}
+```
 
 **scheduler_config.short_request_first_config**
 

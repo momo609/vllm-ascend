@@ -16,11 +16,13 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import math
 from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -28,6 +30,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 
@@ -38,12 +41,78 @@ class AscendDSparkSpeculator(DSparkSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+        self.hardware_aware_config = (
+            get_ascend_config().dspark_hardware_aware_verification
+        )
+        self.use_hardware_aware_verification = (
+            self.hardware_aware_config.enabled
+            and self.hardware_aware_config.has_cost_curves
+        )
+        self.draft_token_confidence_probs = torch.ones_like(
+            self.draft_tokens, dtype=torch.float32
+        )
+        self._confidence_temperatures: torch.Tensor | None = None
+        configured_temperatures = getattr(
+            self.draft_model_config.hf_config,
+            "dspark_confidence_temperatures",
+            None,
+        )
+        if configured_temperatures is not None:
+            valid_temperatures = (
+                isinstance(configured_temperatures, (list, tuple))
+                and len(configured_temperatures) == self.num_speculative_steps
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value > 0
+                    and math.isfinite(value)
+                    for value in configured_temperatures
+                )
+            )
+            if not valid_temperatures:
+                logger.warning_once(
+                    "Invalid dspark_confidence_temperatures; disabling hardware-aware verification."
+                )
+                self.use_hardware_aware_verification = False
+            else:
+                self._confidence_temperatures = torch.tensor(
+                    configured_temperatures,
+                    dtype=torch.float32,
+                    device=device,
+                )
+        elif (
+            self.use_hardware_aware_verification
+            and self.hardware_aware_config.require_calibration
+        ):
+            logger.warning_once(
+                "DSpark confidence calibration is missing; disabling hardware-aware verification."
+            )
+            self.use_hardware_aware_verification = False
 
         # we need to update full graph params in run_fullgraph,
         # so create a stream to update full graph params.
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         if cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
+
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        model = super().load_draft_model(
+            target_model,
+            target_attn_layer_names,
+        )
+        confidence_head = getattr(
+            getattr(model, "model", None), "confidence_head", None
+        )
+        if self.use_hardware_aware_verification and confidence_head is None:
+            logger.warning_once(
+                "DSpark checkpoint has no confidence head; disabling hardware-aware verification."
+            )
+            self.use_hardware_aware_verification = False
+        return model
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
@@ -155,3 +224,46 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 mm_inputs,
                 is_profile=is_profile,
             )
+
+    def _generate_draft(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        """Generate the draft block and its calibrated confidence in one graph."""
+        head_hidden = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        self._sample_sequential(num_reqs, head_hidden)
+        if not self.use_hardware_aware_verification:
+            return
+
+        num_steps = self.num_speculative_steps
+        num_samples = num_reqs * num_steps
+        sample_hidden = head_hidden[self.sample_indices[:num_samples]]
+        anchors = self.input_buffers.input_ids[
+            self._anchor_idx[:num_reqs]
+        ].unsqueeze(1)
+        previous_tokens = torch.cat(
+            (anchors, self.draft_tokens[:num_reqs, : num_steps - 1]),
+            dim=1,
+        ).reshape(-1)
+        markov_embed = self.model.markov_embed(previous_tokens)
+        confidence_logits = self.model.compute_confidence(
+            sample_hidden,
+            markov_embed,
+        ).view(num_reqs, num_steps)
+        if self._confidence_temperatures is not None:
+            confidence_logits = confidence_logits / self._confidence_temperatures
+        torch.sigmoid(
+            confidence_logits,
+            out=self.draft_token_confidence_probs[:num_reqs],
+        )

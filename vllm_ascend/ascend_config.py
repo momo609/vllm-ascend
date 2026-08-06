@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +55,12 @@ class AscendConfig:
         self.scheduler_config = SchedulerConfig(
             additional_config,
             balance_env_value=ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,
+        )
+        self.dspark_hardware_aware_verification = (
+            DSparkHardwareAwareVerificationConfig(
+                additional_config.get("dspark_hardware_aware_verification"),
+                vllm_config,
+            )
         )
         if self.scheduler_config.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
@@ -702,6 +709,133 @@ class BatchJobSchedConfig:
                 f"batch_job_sched_config.short_decode_token_threshold must be positive, "
                 f"got {self.short_decode_token_threshold}"
             )
+
+
+class DSparkHardwareAwareVerificationConfig:
+    """Configuration for DSpark hardware-aware verification.
+
+    The first implementation uses configured NPU timing curves and a stale
+    CPU confidence snapshot. Runtime profiling and live device-side ranking
+    are intentionally separate follow-up stages.
+    """
+
+    _SUPPORTED_ALLOCATION_MODES = {"stale_cpu"}
+    _SUPPORTED_PROFILE_MODES = {"configured"}
+
+    def __init__(self, config: dict[str, Any] | None, vllm_config: "VllmConfig"):
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise ValueError(
+                "additional_config.dspark_hardware_aware_verification must "
+                f"be a dict, got {type(config).__name__}."
+            )
+
+        self.enabled = config.get("enabled", False)
+        self.allocation_mode = config.get("allocation_mode", "stale_cpu")
+        self.profile_mode = config.get("profile_mode", "configured")
+        self.min_predicted_gain = config.get("min_predicted_gain", 0.02)
+        self.require_calibration = config.get("require_calibration", True)
+        self.cudagraph_limit = config.get("cudagraph_limit", 0)
+        self.draft_cost_curve = self._parse_curve(
+            config.get("draft_cost_curve", []), "draft_cost_curve"
+        )
+        self.verify_cost_curve = self._parse_curve(
+            config.get("verify_cost_curve", []), "verify_cost_curve"
+        )
+        self._validate(vllm_config)
+
+    @staticmethod
+    def _parse_curve(value: Any, name: str) -> list[tuple[int, float]]:
+        if not isinstance(value, list):
+            raise ValueError(
+                "dspark_hardware_aware_verification."
+                f"{name} must be a list of [size, milliseconds] pairs."
+            )
+        curve: list[tuple[int, float]] = []
+        for point in value:
+            if (
+                not isinstance(point, (list, tuple))
+                or len(point) != 2
+                or not isinstance(point[0], int)
+                or isinstance(point[0], bool)
+                or not isinstance(point[1], (int, float))
+                or isinstance(point[1], bool)
+            ):
+                raise ValueError(
+                    "dspark_hardware_aware_verification."
+                    f"{name} entries must be [int size, numeric milliseconds], got {point!r}."
+                )
+            size, milliseconds = int(point[0]), float(point[1])
+            if size <= 0 or milliseconds <= 0 or not math.isfinite(milliseconds):
+                raise ValueError(
+                    "dspark_hardware_aware_verification."
+                    f"{name} entries must be positive, got {point!r}."
+                )
+            curve.append((size, milliseconds))
+        if any(curve[i][0] <= curve[i - 1][0] for i in range(1, len(curve))):
+            raise ValueError(
+                "dspark_hardware_aware_verification."
+                f"{name} sizes must be strictly increasing, got {curve}."
+            )
+        return curve
+
+    def _validate(self, vllm_config: "VllmConfig") -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError(
+                "dspark_hardware_aware_verification.enabled must be a bool, "
+                f"got {type(self.enabled).__name__}."
+            )
+        if self.allocation_mode not in self._SUPPORTED_ALLOCATION_MODES:
+            raise ValueError(
+                "dspark_hardware_aware_verification.allocation_mode must be "
+                f"one of {sorted(self._SUPPORTED_ALLOCATION_MODES)}, got {self.allocation_mode!r}."
+            )
+        if self.profile_mode not in self._SUPPORTED_PROFILE_MODES:
+            raise ValueError(
+                "dspark_hardware_aware_verification.profile_mode must be "
+                f"one of {sorted(self._SUPPORTED_PROFILE_MODES)}, got {self.profile_mode!r}."
+            )
+        if (
+            not isinstance(self.min_predicted_gain, (int, float))
+            or isinstance(self.min_predicted_gain, bool)
+            or self.min_predicted_gain < 0
+            or not math.isfinite(self.min_predicted_gain)
+        ):
+            raise ValueError(
+                "dspark_hardware_aware_verification.min_predicted_gain must be non-negative."
+            )
+        if not isinstance(self.require_calibration, bool):
+            raise ValueError(
+                "dspark_hardware_aware_verification.require_calibration must be a bool."
+            )
+        if (
+            not isinstance(self.cudagraph_limit, int)
+            or isinstance(self.cudagraph_limit, bool)
+            or self.cudagraph_limit < 0
+        ):
+            raise ValueError(
+                "dspark_hardware_aware_verification.cudagraph_limit must be a non-negative integer."
+            )
+
+        speculative_config = vllm_config.speculative_config
+        if self.enabled and (
+            speculative_config is None or not speculative_config.use_dspark()
+        ):
+            raise ValueError(
+                "dspark_hardware_aware_verification requires speculative_config.method='dspark'."
+            )
+        if self.enabled and (
+            not self.draft_cost_curve or not self.verify_cost_curve
+        ):
+            logger.warning_once(
+                "DSpark hardware-aware verification has no configured draft/verify "
+                "cost curves and will fall back to fixed-length verification."
+            )
+
+    @property
+    def has_cost_curves(self) -> bool:
+        return bool(self.draft_cost_curve and self.verify_cost_curve)
 
 
 class RejectionSamplerConfig:
