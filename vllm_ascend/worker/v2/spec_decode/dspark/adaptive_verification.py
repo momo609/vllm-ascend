@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from vllm.logger import logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -260,6 +261,15 @@ class AscendAdaptiveVerificationManager:
         self.req_states = req_states
         self.num_bonus_tokens = num_bonus_tokens
         self.config = config
+        # The v2 RequestState and the v1 AscendInputBatch expose the same
+        # small subset needed by this manager, but use different names for
+        # the speculative-step count. Keep the allocator runner-agnostic so
+        # v1 and v2 share exactly the same planning policy.
+        num_speculative_steps = getattr(
+            req_states,
+            "num_speculative_steps",
+            getattr(req_states, "num_speculative_tokens", 0),
+        )
         self.cost_tables = build_cost_tables_from_curves(
             config.draft_cost_curve,
             config.verify_cost_curve,
@@ -269,10 +279,18 @@ class AscendAdaptiveVerificationManager:
         )
         self.confidences = AsyncStaleConfidenceRing(
             req_states.max_num_reqs,
-            req_states.num_speculative_steps,
+            num_speculative_steps,
             req_states.device,
         )
         self.last_plan: DSparkVerificationPlan | None = None
+        # Runtime counters make hardware-aware behavior directly observable
+        # in the service log instead of inferring it from throughput alone.
+        self.plan_calls = 0
+        self.plan_applied = 0
+        self.plan_noop = 0
+        self.trimmed_draft_tokens = 0
+        self.confidence_batches = 0
+        self.confidence_rows = 0
 
     def reset_slot(self, req_idx: int) -> None:
         self.confidences.reset_slot(req_idx)
@@ -282,6 +300,7 @@ class AscendAdaptiveVerificationManager:
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not draft_tokens:
             return scheduler_output
+        self.plan_calls += 1
 
         req_ids = list(scheduler_output.num_scheduled_tokens)
         # The MVP handles decode-only batches. A mixed batch falls back to the
@@ -326,7 +345,25 @@ class AscendAdaptiveVerificationManager:
         )
         self.last_plan = plan
         if plan is None or plan.trimmed_draft_tokens == 0:
+            self.plan_noop += 1
             return scheduler_output
+
+        self.plan_applied += 1
+        self.trimmed_draft_tokens += plan.trimmed_draft_tokens
+        logger.info(
+            "DSpark HW plan applied: reqs=%d full_draft=%d selected_draft=%d "
+            "trimmed=%d predicted=%.4f fixed=%.4f lengths=%s "
+            "calls=%d applied=%d",
+            len(req_ids),
+            plan.full_draft_budget,
+            plan.draft_budget,
+            plan.trimmed_draft_tokens,
+            plan.predicted_throughput,
+            plan.fixed_throughput,
+            {req_id: plan.draft_lengths[req_id] for req_id in req_ids},
+            self.plan_calls,
+            self.plan_applied,
+        )
 
         compacted = copy.copy(scheduler_output)
         compacted.scheduled_spec_decode_tokens = {
@@ -342,9 +379,54 @@ class AscendAdaptiveVerificationManager:
 
     def record_confidences(self, input_batch: InputBatch, probs: torch.Tensor) -> None:
         valid_rows = ~input_batch.is_prefilling_np
+        self.confidence_batches += 1
+        self.confidence_rows += int(valid_rows.sum())
+        if self.confidence_batches == 1:
+            logger.info(
+                "DSpark HW confidence head active: rows=%d steps=%d",
+                self.confidence_rows,
+                probs.shape[1] if probs.ndim > 1 else 0,
+            )
         self.confidences.record(
             probs[: input_batch.num_reqs],
             input_batch.idx_mapping,
             input_batch.idx_mapping_np,
             valid_rows,
+        )
+
+    def record_confidences_for_req_ids(
+        self, req_ids: list[str], probs: torch.Tensor
+    ) -> None:
+        """Publish confidence rows for the v1 AscendInputBatch path.
+
+        The v1 runner does not expose v2's ``idx_mapping`` and prefill mask,
+        but its request-id map is stable at the point the draft is proposed.
+        v1 calls this after proposal generation, so all rows are decode rows.
+        """
+        if not req_ids or probs.ndim < 2:
+            return
+        try:
+            idx_mapping_np = np.fromiter(
+                (self.req_states.req_id_to_index[req_id] for req_id in req_ids),
+                dtype=np.int32,
+                count=len(req_ids),
+            )
+        except KeyError:
+            return
+        idx_mapping = torch.from_numpy(idx_mapping_np).to(
+            device=probs.device, dtype=torch.long
+        )
+        self.confidence_batches += 1
+        self.confidence_rows += len(req_ids)
+        if self.confidence_batches == 1:
+            logger.info(
+                "DSpark HW confidence head active: rows=%d steps=%d",
+                self.confidence_rows,
+                probs.shape[1],
+            )
+        self.confidences.record(
+            probs[: len(req_ids)],
+            idx_mapping,
+            idx_mapping_np,
+            np.ones(len(req_ids), dtype=np.bool_),
         )

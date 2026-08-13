@@ -170,6 +170,9 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
+from vllm_ascend.worker.v2.spec_decode.dspark.adaptive_verification import (
+    AscendAdaptiveVerificationManager,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -519,6 +522,25 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self.adaptive_verification: AscendAdaptiveVerificationManager | None = None
+        self._num_spec_tokens_to_schedule = self.num_spec_tokens
+        adaptive_config = self.ascend_config.dspark_hardware_aware_verification
+        if (
+            adaptive_config.enabled
+            and adaptive_config.has_cost_curves
+            and isinstance(self.drafter, AscendDSparkProposer)
+        ):
+            self.adaptive_verification = AscendAdaptiveVerificationManager(
+                self.input_batch,
+                1,
+                adaptive_config,
+            )
+            logger.info(
+                "DSpark v1 hardware-aware verification enabled: "
+                "allocation_mode=%s profile_mode=%s num_bonus_tokens=1",
+                adaptive_config.allocation_mode,
+                adaptive_config.profile_mode,
+            )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -766,6 +788,58 @@ class NPUModelRunner(GPUModelRunner):
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)
+
+    def _can_adapt_dspark_verification(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Return whether the v1 batch is safe for stale-CPU allocation."""
+        return bool(
+            self.adaptive_verification is not None
+            and isinstance(self.drafter, AscendDSparkProposer)
+            and getattr(self.drafter, "use_hardware_aware_verification", False)
+            and scheduler_output.scheduled_spec_decode_tokens
+            and not scheduler_output.has_structured_output_requests
+        )
+
+    def _reset_adaptive_slots(self, scheduler_output: "SchedulerOutput") -> None:
+        if self.adaptive_verification is None:
+            return
+        req_ids = set(scheduler_output.finished_req_ids)
+        req_ids.update(scheduler_output.preempted_req_ids)
+        req_ids.update(req.req_id for req in scheduler_output.scheduled_new_reqs)
+        for req_id in req_ids:
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is not None:
+                self.adaptive_verification.reset_slot(req_idx)
+
+    def _record_v1_dspark_confidences(self) -> None:
+        """Publish decode-only confidence rows after draft generation."""
+        if (
+            self.adaptive_verification is None
+            or not isinstance(self.drafter, AscendDSparkProposer)
+            or not getattr(self.drafter, "use_hardware_aware_verification", False)
+        ):
+            return
+        probs = self.drafter.draft_token_confidence_probs
+        req_ids: list[str] = []
+        row_indices: list[int] = []
+        for row, req_id in enumerate(self.input_batch.req_ids):
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            # Confidence is meaningful only for decode rows.  Prefill rows
+            # may share the same draft buffer but have no target verification
+            # event in this step.
+            if (
+                self.input_batch.num_computed_tokens_cpu[req_idx]
+                < self.input_batch.num_prompt_tokens[req_idx]
+            ):
+                continue
+            req_ids.append(req_id)
+            row_indices.append(row)
+        if req_ids:
+            rows = torch.tensor(row_indices, device=probs.device, dtype=torch.long)
+            self.adaptive_verification.record_confidences_for_req_ids(
+                req_ids, probs.index_select(0, rows)
+            )
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -1761,6 +1835,18 @@ class NPUModelRunner(GPUModelRunner):
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        # Plan before the parent updates its persistent batch state.  This is
+        # the same ordering used by the v2 runner and keeps every downstream
+        # v1 metadata structure (token counts, logits offsets, attention
+        # layout) derived from one compacted SchedulerOutput.
+        self._num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
+        self._reset_adaptive_slots(scheduler_output)
+        if self._can_adapt_dspark_verification(scheduler_output):
+            assert self.adaptive_verification is not None
+            scheduler_output = self.adaptive_verification.plan_scheduler_output(
+                scheduler_output
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -1787,6 +1873,10 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                # New request slots are allocated by _update_states. Reset
+                # them now so a recycled slot can never reuse an old
+                # confidence epoch on the following step.
+                self._reset_adaptive_slots(scheduler_output)
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data()
@@ -2196,6 +2286,7 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            self._record_v1_dspark_confidences()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         output_spec_token_ids = None
@@ -2352,6 +2443,24 @@ class NPUModelRunner(GPUModelRunner):
             async_output.async_copy_ready_event,
         )
         return async_output
+
+    def take_draft_token_ids(self):
+        """Trim v1's CPU draft handoff to the last adaptive plan."""
+        draft_output = super().take_draft_token_ids()
+        plan = (
+            self.adaptive_verification.last_plan
+            if self.adaptive_verification is not None
+            else None
+        )
+        if draft_output is None or plan is None:
+            return draft_output
+        draft_output.draft_token_ids = [
+            row[: plan.draft_lengths.get(req_id, len(row))]
+            for req_id, row in zip(
+                draft_output.req_ids, draft_output.draft_token_ids
+            )
+        ]
+        return draft_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

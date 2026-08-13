@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
@@ -101,6 +104,98 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+        # v1 and v2 use the same confidence policy.  The v1 proposer keeps
+        # the confidence rows next to its draft buffer; the runner publishes
+        # them to the shared stale-CPU allocator after each proposal.
+        self.hardware_aware_config = get_ascend_config().dspark_hardware_aware_verification
+        self.use_hardware_aware_verification = (
+            self.hardware_aware_config.enabled
+            and self.hardware_aware_config.has_cost_curves
+        )
+        self.draft_token_confidence_probs = torch.ones(
+            (self.max_batch_size, self.num_speculative_tokens),
+            dtype=torch.float32,
+            device=device,
+        )
+        configured_temperatures = getattr(
+            self.draft_model_config.hf_config,
+            "dspark_confidence_temperatures",
+            None,
+        )
+        self._confidence_temperatures: torch.Tensor | None = None
+        if configured_temperatures is not None:
+            valid_temperatures = (
+                isinstance(configured_temperatures, (list, tuple))
+                and len(configured_temperatures) == self.num_speculative_tokens
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value > 0
+                    and math.isfinite(value)
+                    for value in configured_temperatures
+                )
+            )
+            if not valid_temperatures:
+                logger.warning_once(
+                    "Invalid dspark_confidence_temperatures; disabling "
+                    "hardware-aware verification on the v1 runner."
+                )
+                self.use_hardware_aware_verification = False
+            else:
+                self._confidence_temperatures = torch.tensor(
+                    configured_temperatures,
+                    dtype=torch.float32,
+                    device=device,
+                )
+        elif (
+            self.use_hardware_aware_verification
+            and self.hardware_aware_config.require_calibration
+        ):
+            logger.warning_once(
+                "DSpark confidence calibration is missing; disabling "
+                "hardware-aware verification on the v1 runner."
+            )
+            self.use_hardware_aware_verification = False
+
+    def load_model(self, model: torch.nn.Module) -> None:
+        super().load_model(model)
+        confidence_head = getattr(getattr(self.model, "model", None), "confidence_head", None)
+        if self.use_hardware_aware_verification and (
+            confidence_head is None or not hasattr(self.model, "compute_confidence")
+        ):
+            logger.warning_once(
+                "DSpark checkpoint has no confidence head; disabling "
+                "hardware-aware verification on the v1 runner."
+            )
+            self.use_hardware_aware_verification = False
+
+    def record_confidences(
+        self, sample_hidden_states: torch.Tensor, draft_token_ids: torch.Tensor
+    ) -> None:
+        """Compute confidence probabilities for the just-generated draft.
+
+        ``sample_hidden_states`` is ordered by request and speculative step;
+        ``draft_token_ids`` contains the anchor in column zero followed by
+        the N draft tokens.  Models without a confidence head are disabled at
+        load time and leave the all-ones fallback untouched.
+        """
+        if not self.use_hardware_aware_verification:
+            return
+        num_reqs = draft_token_ids.shape[0]
+        num_steps = self.num_speculative_tokens
+        sample_hidden = sample_hidden_states[: num_reqs * num_steps]
+        previous_tokens = draft_token_ids[:, :num_steps].reshape(-1)
+        markov_embed = self.model.markov_embed(previous_tokens)
+        confidence_logits = self.model.compute_confidence(
+            sample_hidden, markov_embed
+        ).view(num_reqs, num_steps)
+        if self._confidence_temperatures is not None:
+            confidence_logits = confidence_logits / self._confidence_temperatures
+        torch.sigmoid(
+            confidence_logits,
+            out=self.draft_token_confidence_probs[:num_reqs],
+        )
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         # Find draft layers (attention layers added by draft model)

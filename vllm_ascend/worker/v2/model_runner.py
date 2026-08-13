@@ -155,10 +155,25 @@ class NPUModelRunner(GPUModelRunner):
                     ", ".join(unsupported),
                 )
             else:
+                # model_state is initialized later in load_model().  The
+                # default model-state contract uses one target bonus token;
+                # avoid dereferencing the not-yet-created object here.
+                num_bonus_tokens = getattr(
+                    getattr(self, "model_state", None),
+                    "num_new_sampled_tokens_per_step",
+                    1,
+                )
                 self.adaptive_verification = AscendAdaptiveVerificationManager(
                     self.req_states,
-                    self.model_state.num_new_sampled_tokens_per_step,
+                    num_bonus_tokens,
                     adaptive_config,
+                )
+                logger.info(
+                    "DSpark hardware-aware verification enabled: "
+                    "allocation_mode=%s profile_mode=%s num_bonus_tokens=%d",
+                    adaptive_config.allocation_mode,
+                    adaptive_config.profile_mode,
+                    num_bonus_tokens,
                 )
 
         # we need to copy num_computed_tokens back to cpu to help

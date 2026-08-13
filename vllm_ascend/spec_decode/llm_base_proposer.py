@@ -1144,6 +1144,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         logits_bias = self.model.markov_bias(markov_emb)
                         logits[:, idx].add_(logits_bias)
                         draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+                    # The v1 DSpark proposer optionally computes the same
+                    # confidence rows used by the v2 hardware-aware planner.
+                    # Keep this hook local to DSpark so MTP/EAGLE and other
+                    # speculative methods retain their existing path.
+                    if hasattr(self, "record_confidences"):
+                        self.record_confidences(sample_hidden_states, draft_token_ids)
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
