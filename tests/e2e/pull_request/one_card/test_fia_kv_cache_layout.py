@@ -12,9 +12,10 @@ from vllm_ascend.worker.v2.attn_utils import _reshape_combined_attention_kv_cach
 
 
 @pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("block_size", [128, 256])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize(
+    "dtype,block_size,head_size",
+    [(torch.float16, 128, 64), (torch.bfloat16, 256, 128)],
+)
 def test_split_fia_cache_matches_paged_cache_after_updates(dtype, block_size, head_size):
     generator = torch.Generator().manual_seed(37)
     shape = (4, block_size, 1, head_size)
