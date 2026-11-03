@@ -9,6 +9,7 @@ from vllm_ascend.dynamic_spec import (
     _create_controller,
     _update_controller,
     physical_k_runtime_enabled,
+    plan_draft_slots,
     resolve_physical_k,
 )
 
@@ -331,6 +332,21 @@ def test_tp8_enables_physical_k_and_wider_tp_falls_back():
     config.parallel_config.tensor_parallel_size = 16
     assert not physical_k_runtime_enabled(config)
     assert _create_controller(config) is None
+
+
+def test_planned_draft_slots_restore_full_decode_batch():
+    spec = SimpleNamespace(
+        max_num_new_slots_for_drafting=6,
+        use_dflash=lambda: False,
+        parallel_drafting=True,
+        uses_draft_model=lambda: False,
+    )
+    lookup = [0] + [4] * 256
+    planned_k, slots = plan_draft_slots(spec, 7, lookup, 256)
+    assert planned_k == 4
+    assert 2048 // (5 + slots) == 256
+    assert plan_draft_slots(spec, 7, lookup, 400) == (planned_k, slots)
+    assert plan_draft_slots(spec, 7, None, 256) == (7, 6)
 
 
 def test_dynamic_spec_config_validates_compact_interface():

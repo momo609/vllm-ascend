@@ -24,6 +24,9 @@ from vllm_ascend.dynamic_spec import (
     physical_k_runtime_enabled,
     resolve_physical_k,
 )
+from vllm_ascend.dynamic_spec import (
+    batch_bucket as _batch_bucket,
+)
 from vllm_ascend.worker.v2.spec_decode.physical_k_feedback import PhysicalKFeedback
 
 _PROFILE_K: ContextVar[int | None] = ContextVar("ascend_profile_physical_k", default=None)
@@ -41,21 +44,6 @@ def physical_k_profile_scope(physical_k: int | None):
 
 def profiling_physical_k() -> int | None:
     return _PROFILE_K.get()
-
-
-def _batch_bucket(batch_size: int) -> int:
-    return 1 << (max(int(batch_size), 1) - 1).bit_length()
-
-
-def _candidate_k(vllm_config: Any, max_k: int) -> tuple[int, ...]:
-    if not physical_k_runtime_enabled(vllm_config):
-        return ()
-    dynamic = (getattr(vllm_config, "additional_config", None) or {}).get("dynamic_spec_config", {})
-    params = resolve_physical_k(dynamic) or {}
-    if not params.get("auto_tune"):
-        return ()
-    values = range(int(params.get("min_k", 3)), max_k + 1)
-    return tuple(sorted({max(1, min(int(k), max_k)) for k in values} | {max_k}))
 
 
 def _is_tp_rank_zero() -> bool:
@@ -157,9 +145,10 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             )
         return manager
     max_k = int(manager.num_speculative_steps)
-    candidates = _candidate_k(vllm_config, max_k)
-    if not candidates:
+    if params is None or not params["auto_tune"]:
         return manager
+    values = range(params["min_k"], max_k + 1)
+    candidates = tuple(sorted({max(1, min(k, max_k)) for k in values} | {max_k}))
     original_batches = manager.batches_to_profile
     original_set_curves = manager.set_initial_cost_curves
     original_get_num_tokens = manager.get_num_tokens
@@ -173,7 +162,6 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
     manager._physical_k_feedback = (
         PhysicalKFeedback(max_k, params) if params["calibration"] != "off" and _is_tp_rank_zero() else None
     )
-    manager._physical_k_shadow_recommendation = None
     manager._physical_k_last_calibration_logged = {}
     manager._physical_k_last_logged = {}
     manager._physical_k_score_steps = defaultdict(int)
@@ -289,7 +277,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             return None
         return float(np.interp(bucket, xs, ys))
 
-    def score_k(
+    def prepare_score(
         self,
         survival,
         physical_k,
@@ -297,8 +285,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         num_reqs,
         non_draft,
         num_sampling_requests,
-        cost_scale=1.0,
-        policy_survival=None,
+        calibrated=False,
     ):
         draft_cost = lookup_cost(self, physical_k, batch_size)
         if draft_cost is None:
@@ -306,16 +293,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         verify_cost = self.cost_tables[1]
         if non_draft < 0 or non_draft >= len(verify_cost) or not np.all(np.isfinite(survival)):
             return None
-        if policy_survival is None:
-            scores = np.sort(survival[:, :physical_k].reshape(-1))[::-1]
-        else:
-            # Calibration prices the existing AV policy; it does not change
-            # its GPU ranking or CPU budget. Re-sorting by calibrated values
-            # would score a different policy that is never actually executed.
-            policy_scores = policy_survival[:, :physical_k].reshape(-1)
-            order = np.argsort(policy_scores, kind="stable")[::-1]
-            scores = survival[:, :physical_k].reshape(-1)[order]
-            policy_scores = policy_scores[order]
+        policy_scores = survival[:, :physical_k].reshape(-1)
         logits_budget = max(
             0,
             self._max_total_logits - num_reqs * self.num_bonus_tokens,
@@ -323,31 +301,36 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         max_budget = max(
             0,
             min(
-                len(scores),
+                len(policy_scores),
                 logits_budget,
                 len(verify_cost) - non_draft - 1,
             ),
         )
-        scores = scores[:max_budget]
-        expected = np.concatenate(
-            (
-                [num_sampling_requests],
-                num_sampling_requests + np.cumsum(scores),
-            )
-        )
-        total_cost = cost_scale * (draft_cost + verify_cost[non_draft : non_draft + max_budget + 1])
-        if not np.all(np.isfinite(total_cost)) or np.any(total_cost <= 0):
-            return None
-        if policy_survival is not None:
+        base_cost = draft_cost + verify_cost[non_draft : non_draft + max_budget + 1]
+        order = budget = None
+        if calibrated:
             if num_reqs >= len(self.cost_tables[0]):
                 return None
+            # All calibrated bounds price the same executed AV ranking/budget.
+            order = np.argsort(policy_scores, kind="stable")[::-1]
             policy_expected = np.concatenate(
-                ([num_sampling_requests], num_sampling_requests + np.cumsum(policy_scores[:max_budget]))
+                ([num_sampling_requests], num_sampling_requests + np.cumsum(policy_scores[order][:max_budget]))
             )
             policy_cost = self.cost_tables[0][num_reqs] + verify_cost[non_draft : non_draft + max_budget + 1]
             budget = int(np.argmax(policy_expected / policy_cost))
-            return float(expected[budget] / total_cost[budget])
-        return float(np.max(expected / total_cost))
+
+        def score(values=survival, cost_scale=1.0):
+            if not np.all(np.isfinite(values)):
+                return None
+            scores = values[:, :physical_k].reshape(-1)
+            scores = np.sort(scores)[::-1] if order is None else scores[order]
+            expected = np.concatenate(([num_sampling_requests], num_sampling_requests + np.cumsum(scores[:max_budget])))
+            total_cost = cost_scale * base_cost
+            if not np.all(np.isfinite(total_cost)) or np.any(total_cost <= 0):
+                return None
+            return float(np.max(expected / total_cost) if budget is None else expected[budget] / total_cost[budget])
+
+        return score
 
     def recommend(self, num_tokens_per_req, draft_tokens):
         if self._physical_k_draft_costs is None or self.cost_tables is None:
@@ -401,7 +384,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             for k in candidates
             if k <= fresh_width
             and (
-                score := score_k(
+                scorer := prepare_score(
                     self,
                     survival,
                     k,
@@ -412,6 +395,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                 )
             )
             is not None
+            and (score := scorer()) is not None
         ]
         if not scored:
             return None
@@ -428,40 +412,20 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                     prediction = feedback.acceptance.predict(survival, k, sampling, contexts)
                     factor, lower_factor, upper_factor = feedback.cost.estimate((k, bucket, context))
                     feedback.cost_factors[(bucket, k)] = factor
+                    scorer = prepare_score(
+                        self, survival, k, batch_size, num_reqs, non_draft, num_sampling_requests, calibrated=True
+                    )
                     estimates[k] = (
-                        score_k(
-                            self,
-                            prediction.mean,
-                            k,
-                            batch_size,
-                            num_reqs,
-                            non_draft,
-                            num_sampling_requests,
-                            factor,
-                            policy_survival=survival,
-                        ),
-                        score_k(
-                            self,
-                            prediction.lower,
-                            k,
-                            batch_size,
-                            num_reqs,
-                            non_draft,
-                            num_sampling_requests,
-                            upper_factor,
-                            policy_survival=survival,
-                        ),
-                        score_k(
-                            self,
-                            prediction.upper,
-                            k,
-                            batch_size,
-                            num_reqs,
-                            non_draft,
-                            num_sampling_requests,
-                            lower_factor,
-                            policy_survival=survival,
-                        ),
+                        tuple(
+                            scorer(values, scale)
+                            for values, scale in (
+                                (prediction.mean, factor),
+                                (prediction.lower, upper_factor),
+                                (prediction.upper, lower_factor),
+                            )
+                        )
+                        if scorer is not None
+                        else (None, None, None)
                     )
                     # A probe is charged at the upper predicted complete-step
                     # cost, including a full verification budget where possible.
@@ -476,7 +440,6 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                     if best != current and estimates[best][1] > estimates[current][2] * (1.0 + feedback.min_gain):
                         chosen = best
                     feedback.choices[bucket] = chosen
-                    self._physical_k_shadow_recommendation = (batch_size, chosen)
                     if feedback.mode == "online":
                         selected = chosen
                         score = estimates[selected][0]

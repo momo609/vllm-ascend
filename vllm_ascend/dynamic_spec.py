@@ -37,7 +37,6 @@ PHYSICAL_K_PROBE_INTERVAL = 32
 PHYSICAL_K_PROBE_STEPS = 2
 # Also reserve the step that returns from the probe to the selected width.
 PHYSICAL_K_PROBE_COST_STEPS = PHYSICAL_K_PROBE_STEPS + 1
-_PROBE_INTERVAL = PHYSICAL_K_PROBE_INTERVAL
 PHYSICAL_K_DEFAULT_MIN_GAIN = 0.02
 PHYSICAL_K_DEFAULT_PROBE_BUDGET = 0.02
 
@@ -45,6 +44,24 @@ PHYSICAL_K_DEFAULT_PROBE_BUDGET = 0.02
 def _trace_physical_k(message: str, *args: Any) -> None:
     if envs.VLLM_ASCEND_PHYSICAL_K_TRACE:
         logger.info("ASCEND_AV_PHYSICAL_K_TRACE %s", message % args if args else message)
+
+
+def batch_bucket(batch_size: int) -> int:
+    return 1 << (max(int(batch_size), 1) - 1).bit_length()
+
+
+def plan_draft_slots(spec: Any, max_k: int, lookup: list[int] | None, batch_size: int) -> tuple[int, int]:
+    """Return the planned K and extra input slots for one scheduling iteration."""
+    slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+    if spec is None or lookup is None:
+        return max_k, slots
+    if spec.use_dflash():
+        planned_k = lookup[min(batch_size, len(lookup) - 1)]
+        return planned_k, min(slots, planned_k)
+    if spec.parallel_drafting and not spec.uses_draft_model():
+        planned_k = lookup[min(batch_size, len(lookup) - 1)]
+        return planned_k, min(slots, max(0, planned_k - 1))
+    return max_k, slots
 
 
 def resolve_physical_k(dynamic_config: dict[str, Any]) -> dict[str, Any] | None:
@@ -113,7 +130,7 @@ class _BucketState:
     up_steps: int = 0
     dwell_steps: int = 0
     last_probe_observation: int = -1
-    probe_interval: int = _PROBE_INTERVAL
+    probe_interval: int = PHYSICAL_K_PROBE_INTERVAL
     pending_probe_k: int | None = None
     active_probe_k: int | None = None
     probe_steps_remaining: int = 0
@@ -170,9 +187,7 @@ class AdaptiveDraftKController:
             self._bucket_states.pop(1, None)
         self._single_request_id = request_id
 
-    @staticmethod
-    def _batch_bucket(batch_size: int) -> int:
-        return 1 << (max(int(batch_size), 1) - 1).bit_length()
+    _batch_bucket = staticmethod(batch_bucket)
 
     def _state(self, bucket: int) -> _BucketState:
         state = self._bucket_states.get(bucket)
@@ -248,7 +263,7 @@ class AdaptiveDraftKController:
         cost_saving_k: int | None = None,
         *,
         probe_k: int | None = None,
-        probe_interval: int = _PROBE_INTERVAL,
+        probe_interval: int = PHYSICAL_K_PROBE_INTERVAL,
     ) -> None:
         # Accept the legacy transport argument without allowing an independent
         # acceptance threshold to override the worker's complete utility score.
@@ -298,19 +313,7 @@ class AdaptiveDraftKController:
                 probe_k, state.pending_probe_k = state.pending_probe_k, None
                 return self._begin_probe(state, min(probe_k, configured_k))
             if state.profile_k == state.stable_k == self.max_k:
-                result = min(state.stable_k, configured_k)
-                if self._last_traced_cap.get(bucket) != result:
-                    _trace_physical_k(
-                        "cap bucket=%d batch=%d configured=%d profile=%s stable=%d result=%d",
-                        bucket,
-                        batch_size,
-                        configured_k,
-                        state.profile_k,
-                        state.stable_k,
-                        result,
-                    )
-                    self._last_traced_cap[bucket] = result
-                return result
+                return self._cap_result(state, bucket, batch_size, configured_k)
             bucket = self._settled_bucket(batch_size)
             state = self._state(bucket)
             if (
@@ -322,20 +325,23 @@ class AdaptiveDraftKController:
             ):
                 state.last_probe_observation = state.observations
                 return self._begin_probe(state, configured_k)
-            result = min(state.stable_k, configured_k)
-            if self._last_traced_cap.get(bucket) != result:
-                _trace_physical_k(
-                    "cap bucket=%d batch=%d configured=%d profile=%s stable=%d result=%d",
-                    bucket,
-                    batch_size,
-                    configured_k,
-                    state.profile_k,
-                    state.stable_k,
-                    result,
-                )
-                self._last_traced_cap[bucket] = result
-            return result
+            return self._cap_result(state, bucket, batch_size, configured_k)
         return configured_k
+
+    def _cap_result(self, state: _BucketState, bucket: int, batch_size: int, configured_k: int) -> int:
+        result = min(state.stable_k, configured_k)
+        if self._last_traced_cap.get(bucket) != result:
+            _trace_physical_k(
+                "cap bucket=%d batch=%d configured=%d profile=%s stable=%d result=%d",
+                bucket,
+                batch_size,
+                configured_k,
+                state.profile_k,
+                state.stable_k,
+                result,
+            )
+            self._last_traced_cap[bucket] = result
+        return result
 
     def observe(
         self,
@@ -454,7 +460,7 @@ def _update_controller(controller, scheduler_output, model_runner_output) -> Non
                 recommended_batch_size,
                 physical_k,
                 probe_k=getattr(model_runner_output, "physical_k_probe", None),
-                probe_interval=getattr(model_runner_output, "physical_k_probe_interval", _PROBE_INTERVAL),
+                probe_interval=getattr(model_runner_output, "physical_k_probe_interval", PHYSICAL_K_PROBE_INTERVAL),
             )
     if recommendation is None and scheduler_batch_size < PHYSICAL_K_MIN_TUNED_BATCH_SIZE:
         return

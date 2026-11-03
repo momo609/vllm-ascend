@@ -46,6 +46,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
+from vllm_ascend.dynamic_spec import plan_draft_slots
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -287,20 +288,12 @@ class ProfilingChunkScheduler(Scheduler):
         time_budget = target_latency if target_latency is not None else float("inf")
         # <<< PROFILING CHUNK <<<
         token_budget = self.max_num_scheduled_tokens
-        spec = self.vllm_config.speculative_config
-        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
-        planned_dynamic_k = self.num_spec_tokens
-        if (
-            spec is not None
-            and self.dynamic_sd_lookup is not None
-            and (spec.use_dflash() or (spec.parallel_drafting and not spec.uses_draft_model()))
-        ):
-            planned_batch = min(len(self.running) + len(self.waiting), len(self.dynamic_sd_lookup) - 1)
-            planned_dynamic_k = self.dynamic_sd_lookup[planned_batch]
-            if spec.use_dflash():
-                draft_slots = min(draft_slots, planned_dynamic_k)
-            elif spec.parallel_drafting and not spec.uses_draft_model():
-                draft_slots = min(draft_slots, max(0, planned_dynamic_k - 1))
+        planned_dynamic_k, draft_slots = plan_draft_slots(
+            self.vllm_config.speculative_config,
+            self.num_spec_tokens,
+            self.dynamic_sd_lookup,
+            len(self.running) + len(self.waiting),
+        )
         input_budget = self.scheduler_config.max_num_batched_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.

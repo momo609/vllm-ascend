@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from vllm_ascend.dynamic_spec import PHYSICAL_K_RECOMMEND_INTERVAL
+from vllm_ascend.dynamic_spec import PHYSICAL_K_RECOMMEND_INTERVAL, batch_bucket
 from vllm_ascend.worker.v2.spec_decode.physical_k_calibration import (
     AcceptanceCalibrator,
     ProbeBudget,
@@ -159,7 +159,7 @@ class PhysicalKFeedback:
         if not np.all(np.isfinite(raw)):
             return
         widths = np.asarray([self.draft_widths[req_id] for req_id in req_ids])
-        bucket = 1 << (len(req_ids) - 1).bit_length()
+        bucket = batch_bucket(len(req_ids))
         forecast = Forecast(tuple(req_ids), raw, widths, sampling, contexts, scheduled, bucket)
         forecast.calibrated = raw.copy()
         for width in np.unique(widths):

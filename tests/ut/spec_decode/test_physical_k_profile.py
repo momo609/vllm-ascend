@@ -346,7 +346,7 @@ def test_shadow_collects_calibrated_choice_without_applying_it():
     teach_acceptance(manager, 3, 3)
     manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
     assert manager._physical_k_recommendation == (8, 4)
-    assert manager._physical_k_shadow_recommendation == (8, 3)
+    assert manager._physical_k_feedback.choices[8] == 3
     assert manager._physical_k_probe is None
 
 

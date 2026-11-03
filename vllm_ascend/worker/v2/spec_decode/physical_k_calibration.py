@@ -15,14 +15,13 @@ from math import ceil
 
 import numpy as np
 
-from vllm_ascend.dynamic_spec import PHYSICAL_K_PROBE_COST_STEPS
+from vllm_ascend.dynamic_spec import PHYSICAL_K_PROBE_COST_STEPS, PHYSICAL_K_PROBE_INTERVAL
 
 _CONFIDENCE_BINS = 16
 _PRIOR_STEPS = 8.0
 _HALF_LIFE_STEPS = 256.0
 _MAX_GROUPS = 128
 _UNCERTAINTY_MULTIPLIER = 2.0
-_MIN_PROBE_INTERVAL = 32
 
 SamplingKey = tuple[float, float, int, float]
 
@@ -217,7 +216,7 @@ class ProbeBudget:
         self.credit = min(self.credit + self.fraction * step_ms, max(2.0 * step_ms, self.max_probe_ms))
 
     def choose(self, candidates: list[int], costs: dict[int, float], current_k: int) -> int | None:
-        if self.fraction <= 0 or self.steps - self.last_probe < _MIN_PROBE_INTERVAL:
+        if self.fraction <= 0 or self.steps - self.last_probe < PHYSICAL_K_PROBE_INTERVAL:
             return None
         alternatives = [k for k in candidates if k != current_k]
         if not alternatives:
@@ -240,7 +239,7 @@ class ProbeBudget:
         if self.fraction <= 0:
             return 0
         return max(
-            _MIN_PROBE_INTERVAL,
+            PHYSICAL_K_PROBE_INTERVAL,
             ceil(
                 PHYSICAL_K_PROBE_COST_STEPS
                 * max(full_ms, current_ms)
