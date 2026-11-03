@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
-from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
@@ -614,7 +614,7 @@ def test_sample_tokens_forwards_physical_k_recommendation():
     runner.use_spec_pp = False
     runner.pcp_manager = None
     runner.adaptive_verification = SimpleNamespace(
-        _physical_k_recommendation=(4, 3), _physical_k_cost_saving=3
+        _physical_k_recommendation=(4, 3), _physical_k_probe=4, _physical_k_probe_interval=100
     )
     model_output = ModelRunnerOutput(req_ids=["req-0"], req_id_to_index={"req-0": 0})
     assert not hasattr(model_output, "physical_k_recommendation")
@@ -622,15 +622,15 @@ def test_sample_tokens_forwards_physical_k_recommendation():
     with patch.object(GPUModelRunner, "sample_tokens", return_value=async_output):
         assert runner.sample_tokens(None) is async_output
     assert model_output.physical_k_recommendation == (4, 3)
-    assert model_output.physical_k_cost_saving == 3
+    assert model_output.physical_k_probe == 4
+    assert model_output.physical_k_probe_interval == 100
     assert runner.adaptive_verification._physical_k_recommendation is None
-    assert runner.adaptive_verification._physical_k_cost_saving is None
 
 
 def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
     """Cache binding precedes KDA preparation and preserves PCP setup."""
     runner = _make_runner()
-    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.compilation_config = SimpleNamespace(static_forward_context={}, cudagraph_mode=CUDAGraphMode.NONE)
     runner.vllm_config = SimpleNamespace(
         compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
     )
@@ -688,7 +688,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
 def test_initialize_kv_cache_forwards_allocation_context():
     """Forward allocation context before preparing KDA state-copy plans."""
     runner = _make_runner()
-    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.compilation_config = SimpleNamespace(static_forward_context={}, cudagraph_mode=CUDAGraphMode.NONE)
     runner.vllm_config = SimpleNamespace(
         compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
     )
@@ -794,6 +794,7 @@ def _prepare_inputs_runner(*, draft=False, full_cg=False, use_dcp=False, use_pp=
     runner.device = torch.device("cpu")
     runner.decode_query_len = 1
     runner.use_dcp = use_dcp
+    runner.num_speculative_steps = 2 if draft else 0
     runner.dcp_size = 2
     runner.dcp_rank = 0
     runner.cp_interleave = False
@@ -825,6 +826,7 @@ def _prepare_inputs_runner(*, draft=False, full_cg=False, use_dcp=False, use_pp=
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tokens=draft_tokens,
         has_structured_output_requests=False,
+        num_spec_tokens_to_schedule=runner.num_speculative_steps,
         num_scheduled_tokens={"r0": 2, "r1": 2},
         scheduled_cached_reqs=SimpleNamespace(req_ids=["r0"] if speculator else []),
     )

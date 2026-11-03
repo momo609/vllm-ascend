@@ -45,6 +45,7 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     GPUModelRunner,
 )
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -61,6 +62,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.dynamic_spec import PHYSICAL_K_PROBE_INTERVAL
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     is_pd_decode_recompute_scheduler_enabled,
@@ -303,17 +305,22 @@ class NPUModelRunner(GPUModelRunner):
         if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
+        calibration_batch = getattr(getattr(self, "execute_model_state", None), "input_batch", None)
         output = super().sample_tokens(grammar_output)
         manager = getattr(self, "adaptive_verification", None)
         if manager is not None:
+            feedback = getattr(manager, "_physical_k_feedback", None)
+            if feedback is not None:
+                feedback.finish_step(self, output, calibration_batch)
             recommendation = getattr(manager, "_physical_k_recommendation", None)
             manager._physical_k_recommendation = None
-            cost_saving_k = getattr(manager, "_physical_k_cost_saving", None)
-            manager._physical_k_cost_saving = None
             output_container = getattr(output, "model_runner_output", output)
             if output_container is not None and recommendation is not None:
                 output_container.physical_k_recommendation = recommendation
-                output_container.physical_k_cost_saving = cost_saving_k
+                output_container.physical_k_probe = getattr(manager, "_physical_k_probe", None)
+                output_container.physical_k_probe_interval = getattr(
+                    manager, "_physical_k_probe_interval", PHYSICAL_K_PROBE_INTERVAL
+                )
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_drafts()
@@ -324,10 +331,13 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
-        with graph_manager_wrapper(self), adaptive_verification_gate_wrapper(
-            vllm_model_runner,
-            self.compilation_config.cudagraph_mode,
-            self.vllm_config,
+        with (
+            graph_manager_wrapper(self),
+            adaptive_verification_gate_wrapper(
+                vllm_model_runner,
+                self.compilation_config.cudagraph_mode,
+                self.vllm_config,
+            ),
         ):
             super().initialize_kv_cache(
                 kv_cache_config,
@@ -405,6 +415,10 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
+        manager = getattr(self, "adaptive_verification", None)
+        feedback = getattr(manager, "_physical_k_feedback", None)
+        if feedback is not None and not dummy_run and not is_profile:
+            feedback.begin_step(self)
         output = super().execute_model(
             scheduler_output,
             intermediate_tensors=intermediate_tensors,
@@ -488,6 +502,7 @@ class NPUModelRunner(GPUModelRunner):
                 "batch, a request-arrival step misclassified as prefill, or a full prefill "
                 "scheduled locally — a request sent directly to the decode node)."
             )
+
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -591,8 +606,8 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
         if adaptive_verification_active:
-            cu_num_logits, query_start_loc, total_num_draft_tokens = (
-                adaptive_verification_manager.reallocate_drafts(req_ids, idx_mapping)
+            cu_num_logits, query_start_loc, total_num_draft_tokens = adaptive_verification_manager.reallocate_drafts(
+                req_ids, idx_mapping
             )
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
 

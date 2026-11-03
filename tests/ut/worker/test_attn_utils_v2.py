@@ -96,6 +96,7 @@ def _spec_compress_ratio(spec) -> int:
 @pytest.fixture(autouse=True)
 def default_pa_disabled(monkeypatch):
     monkeypatch.setattr(attn_utils, "requires_contiguous_pa_kv_cache", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(attn_utils, "requires_contiguous_fia_kv_cache", lambda *_args, **_kwargs: False)
 
 
 def _configure_pa_allocation_check(monkeypatch, vllm_config, pa_enabled):
@@ -117,7 +118,7 @@ def _configure_pa_allocation_check(monkeypatch, vllm_config, pa_enabled):
     ("cache_kind", "pa_enabled"),
     [
         (cache_kind, pa_enabled)
-        for cache_kind in ("full", "sliding_window", "sparse", "full_sparse", "mixed")
+        for cache_kind in ("full", "fia", "sliding_window", "sparse", "full_sparse", "mixed")
         for pa_enabled in (False, True)
     ]
     + [("c8", True), ("dcp", True)],
@@ -125,14 +126,24 @@ def _configure_pa_allocation_check(monkeypatch, vllm_config, pa_enabled):
 def test_main_allocator_attention_layout(
     monkeypatch, block_size, kernel_block_size, kv_transfer, cache_kind, pa_enabled
 ):
+    _check_main_allocator_attention_layout(
+        monkeypatch, block_size, kernel_block_size, kv_transfer, cache_kind, pa_enabled
+    )
+
+
+def _check_main_allocator_attention_layout(
+    monkeypatch, block_size, kernel_block_size, kv_transfer, cache_kind, pa_enabled, *, head_size=64, head_size_v=None
+):
     layer_name = "model.layers.0.self_attn.attn"
     second_layer_name = "model.layers.1.self_attn.attn"
     spec_type = SlidingWindowSpec if cache_kind == "sliding_window" else FullAttentionSpec
     extra_args = {"sliding_window": 4096} if cache_kind == "sliding_window" else {}
+    if head_size_v is not None:
+        extra_args["head_size_v"] = head_size_v
     spec = spec_type(
         block_size=block_size,
         num_kv_heads=2,
-        head_size=64,
+        head_size=head_size,
         dtype=torch.float16,
         **extra_args,
     )
@@ -184,6 +195,12 @@ def test_main_allocator_attention_layout(
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args, **_kwargs: cache_kind == "sparse")
     monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda *_args, **_kwargs: False)
     _configure_pa_allocation_check(monkeypatch, vllm_config, pa_enabled)
+    if cache_kind == "fia":
+        # Speculative decode uses FIA even when PA shapes are configured.
+        vllm_config.speculative_config = SimpleNamespace(method="dspark")
+        monkeypatch.setattr(
+            attn_utils, "requires_contiguous_fia_kv_cache", attention_utils.requires_contiguous_fia_kv_cache
+        )
 
     kv_caches = attn_utils.allocate_kv_cache_main(
         kv_cache_config,
@@ -199,13 +216,18 @@ def test_main_allocator_attention_layout(
         spec.num_kv_heads,
         spec.head_size,
     )
+    expected_v_shape = (*expected_shape[:-1], getattr(spec, "head_size_v", spec.head_size))
     assert key_cache.shape == expected_shape
-    assert value_cache.shape == expected_shape
+    assert value_cache.shape == expected_v_shape
     second_key, second_value = kv_caches[second_layer_name]
     assert second_key.shape == expected_shape
-    assert second_value.shape == expected_shape
+    assert second_value.shape == expected_v_shape
     block_elements = kernel_block_size * spec.num_kv_heads * spec.head_size
-    if cache_kind in ("c8", "dcp") or (cache_kind in ("full", "mixed") and not pa_enabled):
+    if (
+        cache_kind in ("c8", "dcp")
+        or (cache_kind in ("full", "mixed") and not pa_enabled)
+        or (cache_kind == "fia" and kv_transfer)
+    ):
         assert not key_cache.is_contiguous()
         assert not value_cache.is_contiguous()
         assert key_cache.stride(0) == value_cache.stride(0) == 2 * block_elements
@@ -220,6 +242,11 @@ def test_main_allocator_attention_layout(
         assert key_cache.is_contiguous()
         assert value_cache.is_contiguous()
         assert key_cache.untyped_storage().data_ptr() != value_cache.untyped_storage().data_ptr()
+        if cache_kind == "fia" and not kv_transfer:
+            assert (
+                key_cache.untyped_storage().nbytes() + value_cache.untyped_storage().nbytes()
+                == num_blocks * spec.page_size_bytes
+            )
     if cache_kind == "mixed":
         assert second_key.is_contiguous()
         assert second_value.is_contiguous()
@@ -235,6 +262,39 @@ def test_main_allocator_attention_layout(
     assert torch.count_nonzero(value_cache[3:]) == 0
     assert torch.count_nonzero(second_key) == 0
     assert torch.count_nonzero(second_value) == 0
+
+
+@pytest.mark.parametrize(("head_size", "head_size_v"), [(64, 96), (192, 128)])
+def test_main_allocator_fia_asymmetric_head_sizes(monkeypatch, head_size, head_size_v):
+    _check_main_allocator_attention_layout(
+        monkeypatch, 128, 128, False, "fia", False, head_size=head_size, head_size_v=head_size_v
+    )
+
+
+@pytest.mark.parametrize(
+    "disabled", [None, "transfer", "padding", "c8", "dcp", "pcp_config", "dcp_config", "sliding", "pooling", "fp32"]
+)
+def test_contiguous_fia_cache_eligibility(disabled):
+    spec = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=64, dtype=torch.bfloat16)
+    impl_cls = {"c8": AscendC8AttentionBackendImpl, "dcp": AscendAttentionDCPImpl}.get(
+        disabled, AscendAttentionBackendImpl
+    )
+    impl = impl_cls.__new__(impl_cls)
+    impl.sliding_window = 4096 if disabled == "sliding" else None
+    layer = SimpleNamespace(impl=impl)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(runner_type="pooling" if disabled == "pooling" else "generate"),
+        kv_transfer_config=object() if disabled == "transfer" else None,
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2 if disabled == "pcp_config" else 1,
+            decode_context_parallel_size=2 if disabled == "dcp_config" else 1,
+        ),
+    )
+    if disabled == "padding":
+        spec = replace(spec, page_size_padded=spec.real_page_size_bytes + 128)
+    elif disabled == "fp32":
+        spec = replace(spec, dtype=torch.float32)
+    assert attention_utils.requires_contiguous_fia_kv_cache(layer, config, spec) == (disabled is None)
 
 
 @pytest.mark.parametrize("pa_enabled", [False, True])

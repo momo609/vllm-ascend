@@ -20,7 +20,6 @@ from vllm.logger import logger
 
 from vllm_ascend import envs
 
-
 _ACCEPTANCE_EMA_ALPHA = 0.2
 _BUCKET_SWITCH_STEPS = 2
 _MIN_K_DWELL_STEPS = 8
@@ -33,17 +32,19 @@ PHYSICAL_K_MAX_TP_SIZE = 8
 _ACCEPTANCE_THRESHOLD = 0.6
 _DOWNSHIFT_STEPS = 3
 _UPSHIFT_STEPS = 2
-_PROBE_INTERVAL = 32
-# The worker's full-step score is authoritative unless measured acceptance
-# gives strong evidence that the discarded tail is almost never useful. A
-# short low-acceptance spell in a greedy rollout should not override K=5.
-_ACCEPTED_TAIL_THRESHOLD = 0.125
-_ECONOMIC_MIN_OBSERVATIONS = 32
+PHYSICAL_K_PROBE_INTERVAL = 32
+# One step changes draft width; the next can price matching verify/draft work.
+PHYSICAL_K_PROBE_STEPS = 2
+# Also reserve the step that returns from the probe to the selected width.
+PHYSICAL_K_PROBE_COST_STEPS = PHYSICAL_K_PROBE_STEPS + 1
+_PROBE_INTERVAL = PHYSICAL_K_PROBE_INTERVAL
+PHYSICAL_K_DEFAULT_MIN_GAIN = 0.02
+PHYSICAL_K_DEFAULT_PROBE_BUDGET = 0.02
 
 
 def _trace_physical_k(message: str, *args: Any) -> None:
     if envs.VLLM_ASCEND_PHYSICAL_K_TRACE:
-        logger.info("ASCEND_AV_PHYSICAL_K_TRACE " + message, *args)
+        logger.info("ASCEND_AV_PHYSICAL_K_TRACE %s", message % args if args else message)
 
 
 def resolve_physical_k(dynamic_config: dict[str, Any]) -> dict[str, Any] | None:
@@ -54,7 +55,7 @@ def resolve_physical_k(dynamic_config: dict[str, Any]) -> dict[str, Any] | None:
         raise ValueError("physical_k must be an object")
     if dynamic_config.get("method") not in ("dspark", "dflash"):
         raise ValueError("physical_k requires dspark or dflash")
-    unknown = set(physical) - {"min_k", "auto_tune"}
+    unknown = set(physical) - {"min_k", "auto_tune", "calibration", "min_gain", "probe_budget"}
     if unknown:
         raise ValueError(f"Unknown physical_k fields: {sorted(unknown)}")
     min_k = physical.get("min_k", 3)
@@ -63,7 +64,21 @@ def resolve_physical_k(dynamic_config: dict[str, Any]) -> dict[str, Any] | None:
         raise ValueError(f"physical_k.min_k has invalid value {min_k!r}")
     if not isinstance(auto_tune, bool):
         raise ValueError(f"physical_k.auto_tune has invalid value {auto_tune!r}")
-    return {"min_k": min_k, "auto_tune": auto_tune}
+    calibration = physical.get("calibration", "shadow")
+    if calibration not in ("off", "shadow", "online"):
+        raise ValueError("physical_k.calibration must be off, shadow or online")
+    min_gain = physical.get("min_gain", PHYSICAL_K_DEFAULT_MIN_GAIN)
+    probe_budget = physical.get("probe_budget", PHYSICAL_K_DEFAULT_PROBE_BUDGET)
+    for name, value in (("min_gain", min_gain), ("probe_budget", probe_budget)):
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value < 1:
+            raise ValueError(f"physical_k.{name} must be a finite number in [0, 1)")
+    return {
+        "min_k": min_k,
+        "auto_tune": auto_tune,
+        "calibration": calibration,
+        "min_gain": float(min_gain),
+        "probe_budget": float(probe_budget),
+    }
 
 
 def physical_k_runtime_enabled(vllm_config: Any) -> bool:
@@ -76,9 +91,7 @@ def physical_k_runtime_enabled(vllm_config: Any) -> bool:
     the ordinary adaptive path without its controller overhead.
     """
 
-    dynamic = (getattr(vllm_config, "additional_config", None) or {}).get(
-        "dynamic_spec_config", {}
-    )
+    dynamic = (getattr(vllm_config, "additional_config", None) or {}).get("dynamic_spec_config", {})
     if not isinstance(dynamic, dict) or (params := resolve_physical_k(dynamic)) is None:
         return False
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -93,7 +106,6 @@ class _BucketState:
     stable_k: int
     profile_k: int | None
     empirical_k: int
-    economic_k: int | None
     survival: list[float]
     survival_seen: list[bool]
     observations: int = 0
@@ -101,6 +113,10 @@ class _BucketState:
     up_steps: int = 0
     dwell_steps: int = 0
     last_probe_observation: int = -1
+    probe_interval: int = _PROBE_INTERVAL
+    pending_probe_k: int | None = None
+    active_probe_k: int | None = None
+    probe_steps_remaining: int = 0
 
 
 @dataclass
@@ -117,6 +133,7 @@ class AdaptiveDraftKController:
     min_k: int = 1
     auto_tune: bool = True
     require_profile_for_downshift: bool = False
+    probe_steps: int = 1
 
     def __post_init__(self) -> None:
         self.max_k = max(int(self.max_k), 0)
@@ -127,6 +144,19 @@ class AdaptiveDraftKController:
         self._pending_bucket_steps = 0
         self._single_request_id: str | None = None
         self._last_traced_cap: dict[int, int] = {}
+        self._last_cap_bucket: int | None = None
+        self.probe_steps = max(1, int(self.probe_steps))
+
+    @staticmethod
+    def _cancel_probe(state: _BucketState) -> None:
+        state.pending_probe_k = None
+        state.active_probe_k = None
+        state.probe_steps_remaining = 0
+
+    def _begin_probe(self, state: _BucketState, physical_k: int) -> int:
+        state.active_probe_k = physical_k
+        state.probe_steps_remaining = self.probe_steps - 1
+        return physical_k
 
     def observe_single_request(self, request_id: str) -> None:
         """Do not carry a previous request's K decision into a new rollout.
@@ -151,7 +181,6 @@ class AdaptiveDraftKController:
                 stable_k=self.max_k,
                 profile_k=None,
                 empirical_k=self.max_k,
-                economic_k=None,
                 survival=[1.0] * self.max_k,
                 survival_seen=[False] * self.max_k,
             )
@@ -181,13 +210,6 @@ class AdaptiveDraftKController:
     def _desired_k(self, state: _BucketState) -> int:
         if self.auto_tune and state.profile_k is not None:
             desired = state.profile_k
-            if (
-                state.economic_k is not None
-                and state.observations >= _ECONOMIC_MIN_OBSERVATIONS
-                and all(state.survival_seen[state.economic_k :])
-                and sum(state.survival[state.economic_k :]) <= _ACCEPTED_TAIL_THRESHOLD
-            ):
-                desired = min(desired, state.economic_k)
         elif self.auto_tune and self.require_profile_for_downshift:
             # AV can price each captured draft width. Keep collecting fresh
             # full-width confidences until it has made that comparison;
@@ -224,15 +246,18 @@ class AdaptiveDraftKController:
         batch_size: int,
         physical_k: int,
         cost_saving_k: int | None = None,
+        *,
+        probe_k: int | None = None,
+        probe_interval: int = _PROBE_INTERVAL,
     ) -> None:
+        # Accept the legacy transport argument without allowing an independent
+        # acceptance threshold to override the worker's complete utility score.
+        del cost_saving_k
         physical_k = max(self.min_k, min(int(physical_k), self.max_k))
         state = self._state(self._batch_bucket(batch_size))
         state.profile_k = physical_k
-        state.economic_k = (
-            max(self.min_k, min(int(cost_saving_k), self.max_k - 1))
-            if cost_saving_k is not None
-            else None
-        )
+        state.pending_probe_k = max(self.min_k, min(int(probe_k), self.max_k)) if probe_k is not None else None
+        state.probe_interval = max(0, int(probe_interval))
 
     def advance_profile(self, batch_size: int) -> None:
         """Advance a profiled bucket without rebuilding per-request samples."""
@@ -247,39 +272,66 @@ class AdaptiveDraftKController:
 
     def cap(self, configured_k: int, batch_size: int | None = None) -> int:
         configured_k = max(min(int(configured_k), self.max_k), 0)
+        next_bucket = self._batch_bucket(batch_size) if batch_size else None
+        if next_bucket != self._last_cap_bucket:
+            if (
+                self._last_cap_bucket is not None
+                and (previous := self._bucket_states.get(self._last_cap_bucket)) is not None
+            ):
+                self._cancel_probe(previous)
+            self._last_cap_bucket = next_bucket
         if configured_k == 0:
+            if next_bucket is not None and (state := self._bucket_states.get(next_bucket)) is not None:
+                self._cancel_probe(state)
             return 0
         if batch_size is not None and batch_size < PHYSICAL_K_MIN_TUNED_BATCH_SIZE:
             return configured_k
         if batch_size:
             bucket = self._batch_bucket(batch_size)
             state = self._state(bucket)
+            if state.probe_steps_remaining:
+                if state.active_probe_k is not None and state.active_probe_k <= configured_k:
+                    state.probe_steps_remaining -= 1
+                    return state.active_probe_k
+                self._cancel_probe(state)
+            if state.pending_probe_k is not None:
+                probe_k, state.pending_probe_k = state.pending_probe_k, None
+                return self._begin_probe(state, min(probe_k, configured_k))
             if state.profile_k == state.stable_k == self.max_k:
                 result = min(state.stable_k, configured_k)
                 if self._last_traced_cap.get(bucket) != result:
                     _trace_physical_k(
                         "cap bucket=%d batch=%d configured=%d profile=%s stable=%d result=%d",
-                        bucket, batch_size, configured_k, state.profile_k, state.stable_k, result,
+                        bucket,
+                        batch_size,
+                        configured_k,
+                        state.profile_k,
+                        state.stable_k,
+                        result,
                     )
                     self._last_traced_cap[bucket] = result
                 return result
             bucket = self._settled_bucket(batch_size)
             state = self._state(bucket)
             if (
-                _PROBE_INTERVAL
+                bucket == next_bucket
+                and state.probe_interval
                 and state.observations
-                and state.observations
-                % (16 if state.economic_k is not None else _PROBE_INTERVAL)
-                == 0
+                and state.observations % state.probe_interval == 0
                 and state.last_probe_observation != state.observations
             ):
                 state.last_probe_observation = state.observations
-                return configured_k
+                return self._begin_probe(state, configured_k)
             result = min(state.stable_k, configured_k)
             if self._last_traced_cap.get(bucket) != result:
                 _trace_physical_k(
                     "cap bucket=%d batch=%d configured=%d profile=%s stable=%d result=%d",
-                    bucket, batch_size, configured_k, state.profile_k, state.stable_k, result,
+                    bucket,
+                    batch_size,
+                    configured_k,
+                    state.profile_k,
+                    state.stable_k,
+                    result,
                 )
                 self._last_traced_cap[bucket] = result
             return result
@@ -298,7 +350,7 @@ class AdaptiveDraftKController:
                 return
             state = self._state(self._batch_bucket(active_batch_size))
             state.observations += 1
-            if state.profile_k is not None and state.economic_k is None:
+            if state.profile_k is not None:
                 self._advance_state(state)
                 return
         pairs = [(int(width), tokens) for width, tokens in zip(scheduled_widths, sampled_token_ids) if width > 0]
@@ -366,6 +418,7 @@ def _create_controller(vllm_config: Any) -> AdaptiveDraftKController | None:
         require_profile_for_downshift=bool(
             getattr(vllm_config.speculative_config, "enable_adaptive_verification", False)
         ),
+        probe_steps=PHYSICAL_K_PROBE_STEPS if params["auto_tune"] and params["calibration"] == "online" else 1,
     )
 
 
@@ -378,15 +431,14 @@ def _update_controller(controller, scheduler_output, model_runner_output) -> Non
         controller.observe_single_request(req_ids[0])
     if recommendation is not None:
         recommended_batch_size, physical_k = recommendation
-        cost_saving_k = getattr(model_runner_output, "physical_k_cost_saving", None)
         _trace_physical_k(
             "recommend worker_batch=%d scheduler_batch=%d physical_k=%d",
-            recommended_batch_size, scheduler_batch_size, physical_k,
+            recommended_batch_size,
+            scheduler_batch_size,
+            physical_k,
         )
-        if (
+        if scheduler_batch_size and controller._batch_bucket(recommended_batch_size) != controller._batch_bucket(
             scheduler_batch_size
-            and controller._batch_bucket(recommended_batch_size)
-            != controller._batch_bucket(scheduler_batch_size)
         ):
             # The AV worker may only have fresh draft rows for a subset of
             # scheduled requests. Never apply a K priced for that smaller
@@ -398,12 +450,17 @@ def _update_controller(controller, scheduler_output, model_runner_output) -> Non
                 controller._batch_bucket(scheduler_batch_size),
             )
         else:
-            controller.recommend(recommended_batch_size, physical_k, cost_saving_k)
+            controller.recommend(
+                recommended_batch_size,
+                physical_k,
+                probe_k=getattr(model_runner_output, "physical_k_probe", None),
+                probe_interval=getattr(model_runner_output, "physical_k_probe_interval", _PROBE_INTERVAL),
+            )
     if recommendation is None and scheduler_batch_size < PHYSICAL_K_MIN_TUNED_BATCH_SIZE:
         return
     if recommendation is None and controller.auto_tune and scheduler_batch_size:
         state = controller._state(controller._batch_bucket(scheduler_batch_size))
-        if state.profile_k is not None and state.economic_k is None:
+        if state.profile_k is not None:
             if state.profile_k != state.stable_k or state.stable_k < controller.max_k:
                 controller.advance_profile(scheduler_batch_size)
             return
@@ -420,6 +477,7 @@ def install_scheduler_policy() -> None:
 
     original_init = Scheduler.__init__
     if not getattr(original_init, "_vllm_ascend_physical_k_patched", False):
+
         @wraps(original_init)
         def patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
@@ -431,6 +489,7 @@ def install_scheduler_policy() -> None:
 
     original_after = Scheduler._update_after_schedule
     if not getattr(original_after, "_vllm_ascend_physical_k_patched", False):
+
         @wraps(original_after)
         def patched_after(self, scheduler_output):
             controller = getattr(self, "_ascend_physical_k_controller", None)
@@ -446,6 +505,7 @@ def install_scheduler_policy() -> None:
 
     original_output = Scheduler.update_from_output
     if not getattr(original_output, "_vllm_ascend_physical_k_patched", False):
+
         @wraps(original_output)
         def patched_output(self, scheduler_output, model_runner_output):
             outputs = original_output(self, scheduler_output, model_runner_output)

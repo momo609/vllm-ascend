@@ -67,6 +67,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
     get_tq_fused_slot_bytes,
+    requires_contiguous_fia_kv_cache,
     requires_contiguous_pa_kv_cache,
 )
 from vllm_ascend.core.kv_cache_interface import (
@@ -824,8 +825,9 @@ def _allocate_kv_cache(
     Initialize the KV cache buffer with the correct size. The buffer needs to be
     reshaped to the desired shape before being used by the models.
 
-    FullAttention caches use a combined allocation for block-strided K/V
-    views. Specialized caches keep their existing allocation layouts.
+    Eligible FIA/PA FullAttention caches use contiguous split K/V allocations.
+    Other FullAttention caches use combined block-strided views. Specialized
+    caches keep their existing allocation layouts.
     KV transfer aligns each raw allocation to 2 MiB.
 
     Args:
@@ -1085,9 +1087,10 @@ def _allocate_kv_cache(
                     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
                 layer = attn_layers.get(layer_name)
                 backend = layer.get_attn_backend() if layer is not None else None
-                if (backend is None or not backend.is_sparse()) and not requires_contiguous_pa_kv_cache(
+                contiguous_kv = requires_contiguous_pa_kv_cache(
                     layer, vllm_config, layer_spec
-                ):
+                ) or requires_contiguous_fia_kv_cache(layer, vllm_config, layer_spec)
+                if (backend is None or not backend.is_sparse()) and not contiguous_kv:
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
                 if layer_spec.page_size_bytes != layer_spec.real_page_size_bytes:
@@ -1098,10 +1101,13 @@ def _allocate_kv_cache(
                 k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, layer_spec)
                 if enable_fa_quant(vllm_config):
                     k_factor, v_factor = vllm_config.quant_config.get_kv_quant_split_factor(layer_name, [k_dim, v_dim])
+                    k_size = int(layer_size // k_factor)
+                    v_size = int(layer_size // v_factor)
                 else:
-                    k_factor, v_factor = calc_split_factor([k_dim, v_dim])
-                k_size = int(layer_size // k_factor)
-                v_size = int(layer_size // v_factor)
+                    # A rounded float ratio can truncate an exact split by a
+                    # byte (e.g. K=192, V=128), invalidating the page geometry.
+                    k_size = layer_size * k_dim // (k_dim + v_dim)
+                    v_size = layer_size - k_size
                 k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
                 v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
                 kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)

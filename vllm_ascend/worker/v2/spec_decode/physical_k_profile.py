@@ -15,15 +15,19 @@ from typing import Any
 import numpy as np
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.dynamic_spec import (
     PHYSICAL_K_MAX_TP_SIZE,
     PHYSICAL_K_MIN_TUNED_BATCH_SIZE,
+    PHYSICAL_K_PROBE_INTERVAL,
     PHYSICAL_K_RECOMMEND_INTERVAL,
     physical_k_runtime_enabled,
     resolve_physical_k,
 )
+from vllm_ascend.worker.v2.spec_decode.physical_k_feedback import PhysicalKFeedback
 
 _PROFILE_K: ContextVar[int | None] = ContextVar("ascend_profile_physical_k", default=None)
+_CALIBRATION_LOG_INTERVAL = 64
 
 
 @contextmanager
@@ -123,9 +127,7 @@ def _extend_profile_batches(
 def configure_physical_k_profiling(manager: Any, vllm_config: Any):
     """Add physical-K samples and recommendations to an upstream AV manager."""
 
-    dynamic = (getattr(vllm_config, "additional_config", None) or {}).get(
-        "dynamic_spec_config", {}
-    )
+    dynamic = (getattr(vllm_config, "additional_config", None) or {}).get("dynamic_spec_config", {})
     params = resolve_physical_k(dynamic)
     if params is not None and not physical_k_runtime_enabled(vllm_config):
         tp_size = int(
@@ -137,15 +139,13 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         )
         if tp_size > PHYSICAL_K_MAX_TP_SIZE:
             logger.info(
-                "ASCEND_AV_PHYSICAL_K_FALLBACK tensor_parallel_size=%d "
-                "max_supported_tp=%d mode=adaptive_verification",
+                "ASCEND_AV_PHYSICAL_K_FALLBACK tensor_parallel_size=%d max_supported_tp=%d mode=adaptive_verification",
                 tp_size,
                 PHYSICAL_K_MAX_TP_SIZE,
             )
         else:
             logger.info(
-                "ASCEND_AV_PHYSICAL_K_NOOP min_k=%d configured_k=%d "
-                "mode=adaptive_verification",
+                "ASCEND_AV_PHYSICAL_K_NOOP min_k=%d configured_k=%d mode=adaptive_verification",
                 params["min_k"],
                 int(
                     getattr(
@@ -168,7 +168,13 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
     manager._physical_k_profile_is_upstream = []
     manager._physical_k_draft_costs = None
     manager._physical_k_recommendation = None
-    manager._physical_k_cost_saving = None
+    manager._physical_k_probe = None
+    manager._physical_k_probe_interval = PHYSICAL_K_PROBE_INTERVAL
+    manager._physical_k_feedback = (
+        PhysicalKFeedback(max_k, params) if params["calibration"] != "off" and _is_tp_rank_zero() else None
+    )
+    manager._physical_k_shadow_recommendation = None
+    manager._physical_k_last_calibration_logged = {}
     manager._physical_k_last_logged = {}
     manager._physical_k_score_steps = defaultdict(int)
     manager._physical_k_seen_narrow_draft = defaultdict(bool)
@@ -182,9 +188,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             int(getattr(self.req_states, "max_num_reqs", 0)),
             min_batch_size,
         )
-        sparse = _sparse_profile_batches(
-            [case for case in covered if case["num_tokens"] >= min_batch_size]
-        )
+        sparse = _sparse_profile_batches([case for case in covered if case["num_tokens"] >= min_batch_size])
         self._physical_k_profile_cases.clear()
         self._physical_k_profile_is_upstream.clear()
         per_width_cases: dict[int, list[tuple[dict[str, int], bool]]] = {}
@@ -193,11 +197,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             # curves are unchanged. Lower physical widths only need robust
             # medians for each distinct graph shape.
             batches = covered if physical_k == max_k else sparse
-            upstream_flags = (
-                covered_is_upstream
-                if physical_k == max_k
-                else [False] * len(batches)
-            )
+            upstream_flags = covered_is_upstream if physical_k == max_k else [False] * len(batches)
             per_width_cases[physical_k] = list(zip(batches, upstream_flags))
         # A sequential K sweep confounds width with device warmup/clock drift.
         # Interleave nearby candidate timings while keeping the max-K samples
@@ -244,9 +244,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
 
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
-                gathered: list[dict[int, dict[int, float]] | None] = [
-                    None
-                ] * tp_group.world_size
+                gathered: list[dict[int, dict[int, float]] | None] = [None] * tp_group.world_size
                 dist.all_gather_object(
                     gathered,
                     dict(costs),
@@ -299,14 +297,25 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         num_reqs,
         non_draft,
         num_sampling_requests,
+        cost_scale=1.0,
+        policy_survival=None,
     ):
         draft_cost = lookup_cost(self, physical_k, batch_size)
         if draft_cost is None:
             return None
         verify_cost = self.cost_tables[1]
-        if non_draft >= len(verify_cost):
+        if non_draft < 0 or non_draft >= len(verify_cost) or not np.all(np.isfinite(survival)):
             return None
-        scores = np.sort(survival[:, :physical_k].reshape(-1))[::-1]
+        if policy_survival is None:
+            scores = np.sort(survival[:, :physical_k].reshape(-1))[::-1]
+        else:
+            # Calibration prices the existing AV policy; it does not change
+            # its GPU ranking or CPU budget. Re-sorting by calibrated values
+            # would score a different policy that is never actually executed.
+            policy_scores = policy_survival[:, :physical_k].reshape(-1)
+            order = np.argsort(policy_scores, kind="stable")[::-1]
+            scores = survival[:, :physical_k].reshape(-1)[order]
+            policy_scores = policy_scores[order]
         logits_budget = max(
             0,
             self._max_total_logits - num_reqs * self.num_bonus_tokens,
@@ -326,33 +335,19 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                 num_sampling_requests + np.cumsum(scores),
             )
         )
-        total_cost = draft_cost + verify_cost[non_draft : non_draft + max_budget + 1]
-        return float(np.max(expected / total_cost))
-
-    def cost_floor(self, batch_size: int) -> int | None:
-        """Return the shortest K not dominated by a wider draft graph.
-
-        A wider K that costs no more can emit every proposal available to the
-        shorter K, while AV remains free not to verify its tail. Treat a 2%
-        cost difference as equivalent to avoid selecting a noisy micro-win.
-        """
-
-        measured = {
-            k: cost
-            for k in candidates
-            if (cost := lookup_cost(self, k, batch_size)) is not None
-        }
-        if len(measured) != len(candidates):
+        total_cost = cost_scale * (draft_cost + verify_cost[non_draft : non_draft + max_budget + 1])
+        if not np.all(np.isfinite(total_cost)) or np.any(total_cost <= 0):
             return None
-        for physical_k in candidates:
-            cost = measured[physical_k]
-            if not any(
-                measured[wider_k] <= cost * 1.02
-                for wider_k in candidates
-                if wider_k > physical_k
-            ):
-                return physical_k
-        return max_k
+        if policy_survival is not None:
+            if num_reqs >= len(self.cost_tables[0]):
+                return None
+            policy_expected = np.concatenate(
+                ([num_sampling_requests], num_sampling_requests + np.cumsum(policy_scores[:max_budget]))
+            )
+            policy_cost = self.cost_tables[0][num_reqs] + verify_cost[non_draft : non_draft + max_budget + 1]
+            budget = int(np.argmax(policy_expected / policy_cost))
+            return float(expected[budget] / total_cost[budget])
+        return float(np.max(expected / total_cost))
 
     def recommend(self, num_tokens_per_req, draft_tokens):
         if self._physical_k_draft_costs is None or self.cost_tables is None:
@@ -375,8 +370,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         # periodic K=max probe instead of creating a self-reinforcing low K.
         if fresh_width < max_k:
             return None
-        minimum_useful_k = cost_floor(self, batch_size)
-        if minimum_useful_k is None:
+        if any(lookup_cost(self, k, batch_size) is None for k in candidates):
             return None
         all_slots = np.fromiter(
             (self.req_states.req_id_to_index[req_id] for req_id in req_ids),
@@ -391,10 +385,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         confidence = self._stale_confidences[self._stale_idx].np[slots].astype(np.float64)
         survival = np.cumprod(confidence, axis=1)
         num_non_draft = np.fromiter(
-            (
-                num_tokens_per_req[req_id] - len(draft_tokens.get(req_id, ()))
-                for req_id in req_ids
-            ),
+            (num_tokens_per_req[req_id] - len(draft_tokens.get(req_id, ())) for req_id in req_ids),
             dtype=np.int32,
             count=num_reqs,
         )
@@ -408,7 +399,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         scored = [
             (score, k)
             for k in candidates
-            if minimum_useful_k <= k <= fresh_width
+            if k <= fresh_width
             and (
                 score := score_k(
                     self,
@@ -425,19 +416,98 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
         if not scored:
             return None
         score, selected = max(scored)
-        full_cost = lookup_cost(self, max_k, batch_size)
-        self._physical_k_cost_saving = next(
-            (
-                k
-                for k in candidates
-                if k < max_k
-                and (cost := lookup_cost(self, k, batch_size)) is not None
-                and full_cost is not None
-                and cost <= 0.75 * full_cost
-            ),
-            None,
-        )
         bucket = _batch_bucket(batch_size)
+        feedback = self._physical_k_feedback
+        if feedback is not None:
+            sampling, contexts = feedback.features(self, active)
+            if sampling:
+                estimates = {}
+                predicted_costs = {}
+                context = int(np.max(contexts))
+                for k in candidates:
+                    prediction = feedback.acceptance.predict(survival, k, sampling, contexts)
+                    factor, lower_factor, upper_factor = feedback.cost.estimate((k, bucket, context))
+                    feedback.cost_factors[(bucket, k)] = factor
+                    estimates[k] = (
+                        score_k(
+                            self,
+                            prediction.mean,
+                            k,
+                            batch_size,
+                            num_reqs,
+                            non_draft,
+                            num_sampling_requests,
+                            factor,
+                            policy_survival=survival,
+                        ),
+                        score_k(
+                            self,
+                            prediction.lower,
+                            k,
+                            batch_size,
+                            num_reqs,
+                            non_draft,
+                            num_sampling_requests,
+                            upper_factor,
+                            policy_survival=survival,
+                        ),
+                        score_k(
+                            self,
+                            prediction.upper,
+                            k,
+                            batch_size,
+                            num_reqs,
+                            non_draft,
+                            num_sampling_requests,
+                            lower_factor,
+                            policy_survival=survival,
+                        ),
+                    )
+                    # A probe is charged at the upper predicted complete-step
+                    # cost, including a full verification budget where possible.
+                    verify_idx = min(non_draft + batch_size * k, len(self.cost_tables[1]) - 1)
+                    predicted_costs[k] = upper_factor * (
+                        lookup_cost(self, k, batch_size) + self.cost_tables[1][verify_idx]
+                    )
+                if all(value is not None for estimate in estimates.values() for value in estimate):
+                    current = feedback.choices.get(bucket, max_k)
+                    best = max(candidates, key=lambda k: (estimates[k][0], k))
+                    chosen = current
+                    if best != current and estimates[best][1] > estimates[current][2] * (1.0 + feedback.min_gain):
+                        chosen = best
+                    feedback.choices[bucket] = chosen
+                    self._physical_k_shadow_recommendation = (batch_size, chosen)
+                    if feedback.mode == "online":
+                        selected = chosen
+                        score = estimates[selected][0]
+                        budget = feedback.probe_budget(bucket)
+                        self._physical_k_probe = budget.choose(list(candidates), predicted_costs, selected)
+                        self._physical_k_probe_interval = budget.full_width_interval(
+                            predicted_costs[selected], predicted_costs[max_k]
+                        )
+                    previous_log = self._physical_k_last_calibration_logged.get(bucket, -_CALIBRATION_LOG_INTERVAL)
+                    if (
+                        self._physical_k_last_logged.get(bucket) != selected
+                        or envs.VLLM_ASCEND_PHYSICAL_K_TRACE
+                        or feedback.completed - previous_log >= _CALIBRATION_LOG_INTERVAL
+                    ):
+                        logger.info(
+                            "ASCEND_AV_PHYSICAL_K_CALIBRATION mode=%s batch_bucket=%d "
+                            "raw_k=%d calibrated_k=%d applied_k=%d observations=%d "
+                            "labels=%d raw_brier=%.6f calibrated_brier=%.6f estimates=%s cost_effective_samples=%s",
+                            feedback.mode,
+                            bucket,
+                            max(scored)[1],
+                            chosen,
+                            selected,
+                            feedback.completed,
+                            feedback.labels,
+                            feedback.raw_squared_error / max(feedback.labels, 1),
+                            feedback.calibrated_squared_error / max(feedback.labels, 1),
+                            estimates,
+                            {k: round(feedback.cost.effective_samples((k, bucket, context)), 1) for k in candidates},
+                        )
+                        self._physical_k_last_calibration_logged[bucket] = feedback.completed
         if self._physical_k_last_logged.get(bucket) != selected:
             logger.info(
                 "ASCEND_AV_PHYSICAL_K_DECISION batch_bucket=%d physical_k=%d "
@@ -453,14 +523,27 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
 
     def get_num_tokens(self, num_tokens_per_req, draft_tokens) -> int:
         result = original_get_num_tokens(num_tokens_per_req, draft_tokens)
+        self._physical_k_probe = None
+        self._physical_k_probe_interval = PHYSICAL_K_PROBE_INTERVAL
+        feedback = self._physical_k_feedback
+        if feedback is not None:
+            feedback.capture_forecast(self, num_tokens_per_req, draft_tokens, result)
+            batch_size = len(num_tokens_per_req)
+            if batch_size and self.cost_tables is not None and result < len(self.cost_tables[1]):
+                widths = {feedback.draft_widths.get(req_id, max_k) for req_id in num_tokens_per_req}
+                width = next(iter(widths)) if len(widths) == 1 else max_k
+                draft_ms = lookup_cost(self, width, batch_size)
+                if draft_ms is not None:
+                    factor = feedback.cost_factors.get((_batch_bucket(batch_size), width), 1.0)
+                    feedback.probe_budget(_batch_bucket(batch_size)).advance(
+                        factor * (draft_ms + self.cost_tables[1][result])
+                    )
         # Avoid request-list construction only for an empty batch. Every
         # non-empty concurrency can now use a bucket-specific recommendation.
-        # Confidence scoring is amortized per bucket: score on first entry and
-        # then once every N decode steps, while scheduler acceptance feedback
-        # continues to update the controller on every step.
+        # Confidence scoring and asynchronous calibration samples are amortized
+        # per bucket; the scheduler only executes the resulting K policy.
         if len(num_tokens_per_req) < min_batch_size:
             self._physical_k_recommendation = None
-            self._physical_k_cost_saving = None
         else:
             if len(num_tokens_per_req) == 1:
                 request_id = next(iter(num_tokens_per_req))
@@ -470,6 +553,8 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                     # first subsequent full-width draft, not 128 steps later.
                     self._physical_k_single_request_id = request_id
                     self._physical_k_score_new_request = True
+                    if feedback is not None:
+                        feedback.choices.pop(1, None)
             else:
                 self._physical_k_single_request_id = None
                 self._physical_k_score_new_request = False
@@ -478,11 +563,7 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
             self._physical_k_score_steps[bucket] = steps + 1
             probe_due = False
             if self._physical_k_last_logged.get(bucket, max_k) < max_k:
-                active_widths = [
-                    len(draft_tokens[req_id])
-                    for req_id in num_tokens_per_req
-                    if draft_tokens.get(req_id)
-                ]
+                active_widths = [len(draft_tokens[req_id]) for req_id in num_tokens_per_req if draft_tokens.get(req_id)]
                 if active_widths:
                     if min(active_widths) < max_k:
                         self._physical_k_seen_narrow_draft[bucket] = True
@@ -498,18 +579,13 @@ def configure_physical_k_profiling(manager: Any, vllm_config: Any):
                 and len(draft_tokens.get(self._physical_k_single_request_id, ())) >= max_k
             )
             if steps % PHYSICAL_K_RECOMMEND_INTERVAL == 0 or probe_due or new_request_ready:
-                self._physical_k_cost_saving = None
                 self._physical_k_recommendation = recommend(self, num_tokens_per_req, draft_tokens)
                 if self._physical_k_recommendation is not None:
                     self._physical_k_score_new_request = False
-                if (
-                    self._physical_k_recommendation is not None
-                    and self._physical_k_recommendation[1] == max_k
-                ):
+                if self._physical_k_recommendation is not None and self._physical_k_recommendation[1] == max_k:
                     self._physical_k_seen_narrow_draft[bucket] = False
             else:
                 self._physical_k_recommendation = None
-                self._physical_k_cost_saving = None
         return result
 
     manager.batches_to_profile = MethodType(batches_to_profile, manager)

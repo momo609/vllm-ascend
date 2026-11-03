@@ -21,6 +21,9 @@ def test_compact_defaults_and_override():
     assert resolve_physical_k(compact(min_k=4)) == {
         "min_k": 4,
         "auto_tune": True,
+        "calibration": "shadow",
+        "min_gain": 0.02,
+        "probe_budget": 0.02,
     }
     assert resolve_physical_k(compact()) is not None
     assert resolve_physical_k({"method": "dspark"}) is None
@@ -34,6 +37,10 @@ def test_compact_defaults_and_override():
         {"hybrid": False},
         {"auto_tune": {"warmup_steps": 1}},
         {"unknown": 1},
+        {"calibration": "invalid"},
+        {"min_gain": float("nan")},
+        {"probe_budget": -0.1},
+        {"probe_budget": True},
     ],
 )
 def test_compact_rejects_removed_or_invalid_options(physical):
@@ -85,13 +92,13 @@ def test_profiled_auto_tune_observation_skips_sampled_token_iteration():
     assert controller._state(8).observations == 1
 
 
-def test_cost_saving_profile_uses_actual_low_tail_acceptance():
+def test_legacy_cost_saving_hint_never_overrides_complete_worker_score():
     controller = AdaptiveDraftKController(max_k=5, min_k=3)
     controller.recommend(4, 5, cost_saving_k=3)
     for _ in range(34):
         controller.observe([5] * 4, [[0]] * 4)
     assert controller._state(4).observations == 34
-    assert controller.cap(5, 4) == 3
+    assert controller.cap(5, 4) == 5
 
 
 def test_cost_saving_profile_ignores_short_low_acceptance_spell():
@@ -122,6 +129,64 @@ def test_periodic_probe_forces_full_k():
     assert state.stable_k == 5
 
 
+def test_worker_probe_is_one_shot_and_does_not_change_stable_width():
+    controller = AdaptiveDraftKController(max_k=5, min_k=3)
+    controller.recommend(64, 5, probe_k=3, probe_interval=100)
+    assert controller.cap(5, 64) == 3
+    assert controller.cap(5, 64) == 5
+    assert controller._state(64).stable_k == 5
+
+
+def test_online_probe_burst_survives_regular_recommendations():
+    controller = AdaptiveDraftKController(max_k=5, min_k=3, probe_steps=2)
+    controller.recommend(64, 5, probe_k=3, probe_interval=100)
+    assert controller.cap(5, 64) == 3
+    controller.recommend(64, 5, probe_interval=100)
+    assert controller.cap(5, 64) == 3
+    assert controller.cap(5, 64) == 5
+    assert controller._state(64).stable_k == 5
+
+
+def test_full_width_refresh_has_a_stable_probe_step():
+    controller = AdaptiveDraftKController(max_k=5, min_k=3, probe_steps=2)
+    controller.recommend(64, 3, probe_interval=100)
+    for _ in range(3):
+        controller.advance_profile(64)
+    controller._state(64).observations = 100
+    assert [controller.cap(5, 64) for _ in range(3)] == [5, 5, 3]
+
+
+@pytest.mark.parametrize("interrupted_batch,configured_k", [(32, 5), (0, 5), (64, 0), (64, 2)])
+def test_changed_workload_cancels_unfinished_online_probe(interrupted_batch, configured_k):
+    controller = AdaptiveDraftKController(max_k=5, min_k=3, probe_steps=2)
+    controller.recommend(64, 5, probe_k=4)
+    assert controller.cap(5, 64) == 4
+    controller.cap(configured_k, interrupted_batch)
+    assert controller.cap(5, 64) == 5
+
+
+def test_zero_draft_cap_before_first_decode_does_not_leave_a_probe_bucket():
+    controller = AdaptiveDraftKController(max_k=5, min_k=3, probe_steps=2)
+    assert controller.cap(0, 64) == 0
+    assert controller.cap(5, 32) == 5
+
+
+def test_time_priced_full_width_probe_interval_and_disable():
+    controller = AdaptiveDraftKController(max_k=5, min_k=3)
+    controller.recommend(64, 3, probe_interval=100)
+    for _ in range(3):
+        controller.advance_profile(64)
+    state = controller._state(64)
+    state.observations = 32
+    assert controller.cap(5, 64) == 3
+    state.observations = 100
+    assert controller.cap(5, 64) == 5
+    assert controller.cap(5, 64) == 3
+    controller.recommend(64, 3, probe_interval=0)
+    state.observations = 200
+    assert controller.cap(5, 64) == 3
+
+
 def test_missing_profile_uses_acceptance_fallback():
     controller = AdaptiveDraftKController(max_k=5, min_k=4)
     controller.cap(5, 16)
@@ -131,9 +196,7 @@ def test_missing_profile_uses_acceptance_fallback():
 
 
 def test_adaptive_verification_waits_for_cost_profile_before_downshift():
-    controller = AdaptiveDraftKController(
-        max_k=5, min_k=3, require_profile_for_downshift=True
-    )
+    controller = AdaptiveDraftKController(max_k=5, min_k=3, require_profile_for_downshift=True)
     controller.cap(5, 16)
     for _ in range(8):
         controller.observe([5] * 16, [[0]] * 16)
@@ -148,9 +211,7 @@ def test_adaptive_verification_waits_for_cost_profile_before_downshift():
 
 def test_output_recommendation_drives_controller():
     controller = AdaptiveDraftKController(max_k=5, min_k=3)
-    scheduler_output = SimpleNamespace(
-        scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(16)}
-    )
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(16)})
     model_output = SimpleNamespace(
         physical_k_recommendation=(16, 3),
         req_ids=[str(i) for i in range(16)],
@@ -199,9 +260,7 @@ def test_full_k_profile_is_a_runtime_noop():
 
 def test_worker_recommendation_is_not_applied_to_a_different_batch_bucket():
     controller = AdaptiveDraftKController(max_k=5, min_k=3)
-    scheduler_output = SimpleNamespace(
-        scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(8)}
-    )
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(8)})
     model_output = SimpleNamespace(
         physical_k_recommendation=(1, 3),
         req_ids=[str(i) for i in range(8)],
@@ -221,9 +280,7 @@ def test_small_batch_updates_controller_observation():
             super().observe(scheduled_widths, sampled_token_ids)
 
     controller = CountingController(max_k=5, min_k=3)
-    scheduler_output = SimpleNamespace(
-        scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(8)}
-    )
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={str(i): [1] * 5 for i in range(8)})
     model_output = SimpleNamespace(
         physical_k_recommendation=None,
         req_ids=[str(i) for i in range(8)],
@@ -267,9 +324,7 @@ def test_create_controller_and_opt_out():
     config = SimpleNamespace(
         use_v2_model_runner=True,
         additional_config={"dynamic_spec_config": compact(min_k=4)},
-        speculative_config=SimpleNamespace(
-            num_speculative_tokens=5, enable_adaptive_verification=True
-        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5, enable_adaptive_verification=True),
     )
     assert _create_controller(config).auto_tune
     assert _create_controller(config).require_profile_for_downshift

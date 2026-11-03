@@ -227,6 +227,31 @@ def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAt
     )
 
 
+def requires_contiguous_fia_kv_cache(layer, vllm_config: VllmConfig, spec: FullAttentionSpec) -> bool:
+    """Avoid FIA materializing the complete K/V cache on every decode step.
+
+    Plain, unpadded full-attention pages can use the existing split K/V
+    allocator. Keep hybrid, quantized, context-parallel and transferred cache
+    layouts on their established allocation paths.
+    """
+    # Import lazily to avoid a circular dependency with attention_v1.
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+    impl = getattr(layer, "impl", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return (
+        type(impl) is AscendAttentionBackendImpl
+        and type(spec) is FullAttentionSpec
+        and impl.sliding_window is None
+        and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+        and getattr(parallel_config, "decode_context_parallel_size", 1) == 1
+        and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
+        and vllm_config.kv_transfer_config is None
+        and spec.dtype in (torch.float16, torch.bfloat16)
+        and spec.page_size_bytes == spec.real_page_size_bytes
+    )
+
+
 @lru_cache(maxsize=1)
 def enable_dcp():
     parallel_config = get_current_vllm_config().parallel_config

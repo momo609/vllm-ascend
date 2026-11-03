@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from vllm_ascend.dynamic_spec import PHYSICAL_K_RECOMMEND_INTERVAL
+from vllm_ascend.worker.v2.spec_decode.physical_k_calibration import ProbabilityEstimate
 from vllm_ascend.worker.v2.spec_decode.physical_k_profile import (
     configure_physical_k_profiling,
     physical_k_profile_scope,
@@ -53,7 +54,7 @@ def config():
                 "method": "dspark",
                 "physical_k": {"min_k": 3},
             }
-        }
+        },
     )
 
 
@@ -68,9 +69,7 @@ def test_tp16_keeps_upstream_adaptive_manager_unmodified():
 
 def test_noop_minimum_keeps_upstream_adaptive_manager_unmodified():
     no_op_config = config()
-    no_op_config.additional_config["dynamic_spec_config"]["physical_k"] = {
-        "min_k": 4
-    }
+    no_op_config.additional_config["dynamic_spec_config"]["physical_k"] = {"min_k": 4}
     manager = FakeManager()
 
     assert configure_physical_k_profiling(manager, no_op_config) is manager
@@ -86,8 +85,10 @@ def test_tp8_profiles_physical_k_candidates():
     assert {case["profile_physical_k"] for case in manager.batches_to_profile([8])} == {3, 4}
 
 
-def profiled_manager(cost_k3: float, cost_k4: float):
-    manager = configure_physical_k_profiling(FakeManager(16), config())
+def profiled_manager(cost_k3: float, cost_k4: float, calibration="shadow"):
+    settings = config()
+    settings.additional_config["dynamic_spec_config"]["physical_k"]["calibration"] = calibration
+    manager = configure_physical_k_profiling(FakeManager(16), settings)
     cases = list(manager.batches_to_profile([8, 16]))
     costs = {3: cost_k3, 4: cost_k4}
     manager.set_initial_cost_curves(
@@ -117,11 +118,7 @@ def test_small_config_profiles_all_non_empty_batch_buckets():
     manager = configure_physical_k_profiling(FakeManager(), config())
     cases = list(manager.batches_to_profile([8]))
     buckets_by_k = {
-        physical_k: {
-            case["num_tokens"]
-            for case in cases
-            if case["profile_physical_k"] == physical_k
-        }
+        physical_k: {case["num_tokens"] for case in cases if case["profile_physical_k"] == physical_k}
         for physical_k in (3, 4)
     }
     assert buckets_by_k == {3: {1, 2, 4, 8}, 4: {1, 2, 4, 8}}
@@ -149,11 +146,7 @@ def test_profile_interleaves_widths_without_reordering_upstream_samples():
     manager = configure_physical_k_profiling(FakeManager(), config())
     cases = list(manager.batches_to_profile([8]))
     assert [case["profile_physical_k"] for case in cases[:6]] == [3, 4, 3, 4, 3, 4]
-    upstream = [
-        case
-        for case, is_upstream in zip(cases, manager._physical_k_profile_is_upstream)
-        if is_upstream
-    ]
+    upstream = [case for case, is_upstream in zip(cases, manager._physical_k_profile_is_upstream) if is_upstream]
     assert [case["num_tokens"] for case in upstream] == [8, 8]
 
 
@@ -163,11 +156,7 @@ def test_lower_k_profile_median_ignores_one_cold_replay():
     slow_replay_seen = False
     samples = []
     for case in cases:
-        slow_replay = (
-            case["profile_physical_k"] == 3
-            and case["num_tokens"] == 1
-            and not slow_replay_seen
-        )
+        slow_replay = case["profile_physical_k"] == 3 and case["num_tokens"] == 1 and not slow_replay_seen
         if slow_replay:
             slow_replay_seen = True
         samples.append(
@@ -188,11 +177,7 @@ def test_profile_grid_extends_through_large_rl_batch_buckets():
     manager = configure_physical_k_profiling(manager, config())
     cases = list(manager.batches_to_profile([8]))
     by_k = {
-        physical_k: {
-            case["num_tokens"]
-            for case in cases
-            if case["profile_physical_k"] == physical_k
-        }
+        physical_k: {case["num_tokens"] for case in cases if case["profile_physical_k"] == physical_k}
         for physical_k in (3, 4)
     }
     expected = {1, 2, 4, 8, 16, 32, 64}
@@ -207,7 +192,7 @@ def test_worker_recommends_k_from_profile_cost_and_confidence():
     batch_size, physical_k = manager._physical_k_recommendation
     assert batch_size == 16
     assert physical_k == 3
-    assert manager._physical_k_cost_saving == 3
+    assert manager._physical_k_probe is None
 
 
 def test_small_batch_gets_runtime_recommendation():
@@ -322,3 +307,91 @@ def test_nonzero_tp_rank_skips_runtime_scoring():
     ):
         manager.get_num_tokens(per_req, drafts)
     assert manager._physical_k_recommendation is None
+
+
+def teach_acceptance(manager, width, accepted):
+    feedback = manager._physical_k_feedback
+    rows = 8
+    feedback.sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(np=np.zeros(16)),
+        top_p=SimpleNamespace(np=np.ones(16)),
+        top_k=SimpleNamespace(np=np.full(16, 100)),
+        min_p=SimpleNamespace(np=np.zeros(16)),
+    )
+    raw = np.cumprod(np.full((rows, 4), 0.9), axis=1)
+    sampling, contexts = feedback.features(manager, [str(i) for i in range(rows)])
+    for _ in range(96):
+        feedback.acceptance.observe(
+            raw,
+            np.full(rows, width),
+            sampling,
+            contexts,
+            np.full(rows, accepted + 1),
+            np.full(rows, width - accepted),
+            np.full(rows, width),
+        )
+
+
+def test_online_calibration_can_reverse_raw_confidence_recommendation():
+    manager = profiled_manager(1.0, 1.1, calibration="online")
+    teach_acceptance(manager, 4, 0)
+    teach_acceptance(manager, 3, 3)
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    assert manager._physical_k_recommendation == (8, 3)
+
+
+def test_shadow_collects_calibrated_choice_without_applying_it():
+    manager = profiled_manager(1.0, 1.1, calibration="shadow")
+    teach_acceptance(manager, 4, 0)
+    teach_acceptance(manager, 3, 3)
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    assert manager._physical_k_recommendation == (8, 4)
+    assert manager._physical_k_shadow_recommendation == (8, 3)
+    assert manager._physical_k_probe is None
+
+
+def test_online_uncertainty_avoids_small_unproven_gain():
+    manager = profiled_manager(1.0, 1.5, calibration="online")
+    teach_acceptance(manager, 4, 4)
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    assert manager._physical_k_recommendation == (8, 4)
+
+
+def test_complete_runtime_cost_can_override_an_optimistic_startup_profile():
+    manager = profiled_manager(1.0, 10.0, calibration="online")
+    teach_acceptance(manager, 3, 3)
+    feedback = manager._physical_k_feedback
+    for _ in range(64):
+        feedback.cost.observe((3, 8, 6), predicted_ms=2.0, elapsed_ms=100.0)
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    # K3 looks much cheaper in the draft-only startup profile, but is slower
+    # as a complete runtime step. High acceptance alone must not select it.
+    assert manager._physical_k_recommendation == (8, 4)
+
+
+def test_off_mode_has_no_feedback_or_extra_probe():
+    manager = profiled_manager(1.0, 10.0, calibration="off")
+    assert manager._physical_k_feedback is None
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    assert manager._physical_k_recommendation == (8, 3)
+    assert manager._physical_k_probe is None
+
+
+def test_calibration_prices_actual_av_budget_instead_of_inventing_a_new_policy():
+    manager = profiled_manager(1.0, 1.1, calibration="online")
+    teach_acceptance(manager, 4, 4)
+    manager._stale_confidences[0].np.fill(0.01)
+    manager.cost_tables = (
+        np.ones(17),
+        np.maximum(1.0, 1.0 + 0.05 * (np.arange(128) - 8)),
+    )
+
+    def confident_prediction(raw, width, sampling, contexts):
+        values = np.ones((len(raw), width))
+        return ProbabilityEstimate(values, values, values)
+
+    manager._physical_k_feedback.acceptance.predict = confident_prediction
+    manager.get_num_tokens({str(i): 5 for i in range(8)}, {str(i): [1, 2, 3, 4] for i in range(8)})
+    # Raw AV confidence selects budget zero. Calibrated all-ones predictions
+    # must not pretend that AV verifies every draft and favor the wider K.
+    assert manager._physical_k_recommendation == (8, 3)

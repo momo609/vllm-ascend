@@ -203,6 +203,18 @@ class RecomputeScheduler(Scheduler):
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        planned_dynamic_k = self.num_spec_tokens
+        if (
+            spec is not None
+            and self.dynamic_sd_lookup is not None
+            and (spec.use_dflash() or (spec.parallel_drafting and not spec.uses_draft_model()))
+        ):
+            planned_batch = min(len(self.running) + len(self.waiting), len(self.dynamic_sd_lookup) - 1)
+            planned_dynamic_k = self.dynamic_sd_lookup[planned_batch]
+            if spec.use_dflash():
+                draft_slots = min(draft_slots, planned_dynamic_k)
+            elif spec.parallel_drafting and not spec.uses_draft_model():
+                draft_slots = min(draft_slots, max(0, planned_dynamic_k - 1))
         input_budget = self.scheduler_config.max_num_batched_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -952,7 +964,8 @@ class RecomputeScheduler(Scheduler):
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[len(num_scheduled_tokens)]
+            # A smaller actual batch must not raise K beyond the slots reserved.
+            num_spec_tokens_to_schedule = min(planned_dynamic_k, self.dynamic_sd_lookup[len(num_scheduled_tokens)])
 
         scheduled_encoder_input_stats = None
         if self.log_stats and self.observability_config.enable_logging_iteration_details:

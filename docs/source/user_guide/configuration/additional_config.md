@@ -246,22 +246,53 @@ following minimal configuration:
 | ---- | ---- | ------- | ----------- |
 | `physical_k.min_k` | int | `3` | Lowest candidate K. Maximum K comes from `speculative_config.num_speculative_tokens`. |
 | `physical_k.auto_tune` | bool | `True` | Select physical K from AV startup-profiled NPU costs and confidence estimates. Set to `False` to use the acceptance-based fallback. |
+| `physical_k.calibration` | str | `"shadow"` | `off` disables feedback; `shadow` records calibrated decisions without applying them; `online` uses calibrated acceptance and complete-step costs to choose K. Requires `auto_tune=True`. |
+| `physical_k.min_gain` | float | `0.02` | Required relative utility improvement after accounting for estimated uncertainty before changing K in online mode. Range: `[0, 1)`. |
+| `physical_k.probe_budget` | float | `0.02` | Estimated fraction of decode time available for online exploration, split between full-width refresh and alternate-K probes. `0` disables online probes. Range: `[0, 1)`. |
 
 Candidate and capture widths default to the range from `min_k` to maximum K.
-The worker preserves the full upstream profile for maximum K and profiles two
+The worker preserves the full upstream profile for maximum K and profiles three
 timing samples per graph shape for lower candidate K values, then sends compact
 K recommendations from TP rank 0 to the scheduler. Costs are never extrapolated
 beyond the measured batch range. The scheduler applies profiled recommendations
-per power-of-two batch bucket; empirical acceptance is used only when profiling
-cannot recommend a K or auto-tuning is disabled. This keeps large RL rollout
+per power-of-two batch bucket. With adaptive verification, a missing cost profile
+keeps full K; the acceptance-only fallback applies when AV is absent or
+auto-tuning is disabled. This keeps large RL rollout
 batches adaptive while preventing K oscillation as the active batch shrinks
 after EOS. Small-batch protection,
 batch-bucket switching, K hysteresis, minimum dwell, and periodic full-K probes
-use built-in defaults. A shorter K is never
-selected when a wider profiled graph has equal or lower draft cost, and a
+use built-in defaults. The worker scores all profiled candidate widths. A
 narrowed runtime step cannot overwrite the last full-width recommendation.
 Candidate and capture widths are derived from `min_k`; a candidate without a
 compatible FULL graph may execute eagerly.
+
+Calibration uses sampled/accepted and rejected counts from the V2 sampler before
+the scheduler truncates output at EOS or length limits. AV-unverified positions
+are unknown, not negative labels. Prediction snapshots retain request identity,
+actual draft K, sampling settings, and context bucket. Bounded CPU histograms
+shrink sparse observations towards raw predictions and decay older observations.
+Different actual K values and sampling settings do not share acceptance labels;
+context-specific estimates fall back to statistics for the same model pair, K,
+and sampling settings. A deployed manager owns its own statistics; models and
+process restarts do not share them.
+
+Only TP rank 0 collects feedback, using occasional asynchronous copies and
+nonblocking event polling. Runtime timings include target, sampling, drafting,
+and stream gaps, but are not complete client-observed request latencies. Mixed
+prefill batches, structured-output requests, and steps that transition between
+physical widths do not update complete-step cost estimates. Calibration never
+changes the probabilities or acceptance tests used by the rejection sampler.
+
+Start with `shadow` and inspect `ASCEND_AV_PHYSICAL_K_CALIBRATION` logs, then
+explicitly enable `"physical_k": {"calibration": "online"}`. Online decisions
+  use uncertainty margins and time-priced two-step probes. The first step changes
+  the draft width; the second supplies a stable verify/draft cost sample. The
+  budget reserves three complete steps at the larger current/probe cost, including
+  the transition back. A batch-bucket change cancels an unfinished probe. The budget uses
+estimated runtime-corrected step costs, not a hard wall-clock overhead guarantee.
+Statistical bounds are decision heuristics for correlated runtime feedback, not
+formal confidence guarantees. A/B tests must include cold start and probe costs;
+lower probability error alone does not establish throughput improvement.
 
 **scheduler_config.short_request_first_config**
 
